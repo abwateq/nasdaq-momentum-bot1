@@ -346,7 +346,7 @@ def main() -> None:
     if not ALPACA_KEY_ID or not ALPACA_SECRET_KEY:
         raise SystemExit("ضع ALPACA_API_KEY_ID و ALPACA_API_SECRET_KEY في متغيرات البيئة")
 
-    mode = "كل سوق ناسداك" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
+    mode = "" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
     send_telegram(f"✅ بوت زخم ناسداك اشتغل : {mode}). "
                   "سأنبهك عند ظهور زخم على الأسهم.")
     while True:
