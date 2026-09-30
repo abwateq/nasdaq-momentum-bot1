@@ -42,6 +42,11 @@ ALPACA_KEY_ID = os.getenv("ALPACA_API_KEY_ID", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_API_SECRET_KEY", "")
 ALPACA_FEED = "iex"   # الخطة المجانية: iex فقط. الخطة المدفوعة: sip
 ALPACA_DATA_URL = "https://data.alpaca.markets/v2/stocks/bars"
+ALPACA_ASSETS_URL = "https://api.alpaca.markets/v2/assets"
+
+# فحص كل سوق ناسداك تلقائيًا بدل قائمة يدوية (True/False)
+SCAN_FULL_MARKET = os.getenv("SCAN_FULL_MARKET", "true").lower() == "true"
+SYMBOLS_REFRESH_HOURS = 24     # كل كم ساعة يُحدَّث سجل رموز ناسداك من Alpaca
 
 CHECK_EVERY_SECONDS = 300      # فحص كل 5 دقائق
 RVOL_MIN = 3.0                 # الحجم لازم يكون 3 أضعاف المتوسط أو أكثر
@@ -49,10 +54,14 @@ PRICE_CHANGE_MIN = 1.0         # حركة السعر % خلال آخر 15 دقي
 LOOKBACK_BARS = 20             # عدد الشموع لحساب المتوسط والاختراق
 MIN_PRICE = 2.0                # تجاهل الأسهم الأرخص من هذا السعر
 COOLDOWN_MINUTES = 60          # لا تكرر تنبيه نفس السهم قبل هذه المدة
-BATCH_SIZE = 50                # عدد الأسهم في كل طلب لـ Alpaca
+BATCH_SIZE = 100               # عدد الأسهم في كل طلب لـ Alpaca
 
-# قائمة المراقبة: تغطي تقريبًا كل مكوّنات ناسداك 100 + أسهم نشطة شائعة - عدّلها كما تشاء
-WATCHLIST = [
+# حماية من تجاوز حد الخطة المجانية (200 طلب/دقيقة) - نبقى تحته بهامش أمان
+MAX_REQUESTS_PER_MINUTE = 170
+MIN_REQUEST_INTERVAL = 60.0 / MAX_REQUESTS_PER_MINUTE
+
+# قائمة احتياطية تُستخدم فقط إذا SCAN_FULL_MARKET=False (تغطي تقريبًا ناسداك 100 + أسهم نشطة)
+FALLBACK_WATCHLIST = [
     # ناسداك 100 (تقريبًا)
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "GOOG", "META", "TSLA", "AVGO", "COST",
     "NFLX", "AMD", "ADBE", "PEP", "CSCO", "TMUS", "INTC", "QCOM", "INTU", "AMAT",
@@ -110,6 +119,78 @@ def _alpaca_headers() -> dict:
     }
 
 
+_last_request_time = 0.0
+
+
+def _alpaca_get(url: str, params: dict):
+    """طلب GET لـ Alpaca مع احترام حد الطلبات بالدقيقة وإعادة محاولة عند 429."""
+    global _last_request_time
+    for attempt in range(5):
+        wait = MIN_REQUEST_INTERVAL - (time.time() - _last_request_time)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=30)
+        except requests.RequestException as e:
+            log.warning("فشل طلب Alpaca: %s", e)
+            time.sleep(2)
+            continue
+        _last_request_time = time.time()
+
+        if r.status_code == 429:
+            retry_after = float(r.headers.get("Retry-After", 2))
+            log.warning("تجاوزت حد الطلبات (429)، أنتظر %.1f ثانية...", retry_after)
+            time.sleep(retry_after)
+            continue
+
+        if not r.ok:
+            log.warning("خطأ Alpaca (%d): %s", r.status_code, r.text[:300])
+            return None
+
+        return r
+    return None
+
+
+_symbols_cache: dict = {"symbols": [], "fetched_at": None}
+
+
+def fetch_nasdaq_symbols() -> list[str]:
+    """يجلب كل رموز ناسداك القابلة للتداول من Alpaca، مع تخزين مؤقت يوميًا."""
+    now = datetime.now()
+    if (_symbols_cache["fetched_at"]
+            and (now - _symbols_cache["fetched_at"]).total_seconds() < SYMBOLS_REFRESH_HOURS * 3600
+            and _symbols_cache["symbols"]):
+        return _symbols_cache["symbols"]
+
+    params = {"status": "active", "asset_class": "us_equity"}
+    r = _alpaca_get(ALPACA_ASSETS_URL, params)
+    if r is None:
+        log.warning("تعذر جلب قائمة رموز ناسداك، سأستخدم آخر نسخة محفوظة أو القائمة الاحتياطية")
+        return _symbols_cache["symbols"] or FALLBACK_WATCHLIST
+
+    assets = r.json()
+    symbols = []
+    for a in assets:
+        if a.get("exchange") != "NASDAQ":
+            continue
+        if not a.get("tradable"):
+            continue
+        sym = a.get("symbol", "")
+        # تجاهل الرموز غير القياسية (تفضيلية/وارنتس/وحدات) لتقليل الضجيج
+        if not sym.isalpha() or len(sym) > 5:
+            continue
+        symbols.append(sym)
+
+    if not symbols:
+        log.warning("قائمة الرموز الراجعة من Alpaca فارغة، سأستخدم القائمة الاحتياطية")
+        return FALLBACK_WATCHLIST
+
+    _symbols_cache["symbols"] = symbols
+    _symbols_cache["fetched_at"] = now
+    log.info("تم تحديث قائمة رموز ناسداك: %d رمز", len(symbols))
+    return symbols
+
+
 def _fetch_batch(symbols: list[str]) -> dict:
     """يجلب شموع 5 دقائق لمجموعة أسهم من Alpaca، مع تصفّح next_page_token."""
     start = (datetime.utcnow() - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -129,15 +210,9 @@ def _fetch_batch(symbols: list[str]) -> dict:
     for _ in range(10):  # حماية من حلقة لا نهائية
         if page_token:
             params["page_token"] = page_token
-        try:
-            r = requests.get(ALPACA_DATA_URL, headers=_alpaca_headers(),
-                              params=params, timeout=30)
-        except requests.RequestException as e:
-            log.warning("فشل طلب Alpaca: %s", e)
-            break
 
-        if not r.ok:
-            log.warning("خطأ Alpaca (%d): %s", r.status_code, r.text[:300])
+        r = _alpaca_get(ALPACA_DATA_URL, params)
+        if r is None:
             break
 
         data = r.json()
@@ -153,11 +228,12 @@ def _fetch_batch(symbols: list[str]) -> dict:
 
 
 def fetch_data() -> dict:
-    """يجلب بيانات كل الأسهم من Alpaca على دفعات، ويعيد dict: symbol -> DataFrame."""
+    """يجلب بيانات كل أسهم القائمة من Alpaca على دفعات، ويعيد dict: symbol -> DataFrame."""
+    watchlist = fetch_nasdaq_symbols() if SCAN_FULL_MARKET else FALLBACK_WATCHLIST
     frames: dict[str, pd.DataFrame] = {}
 
-    for i in range(0, len(WATCHLIST), BATCH_SIZE):
-        batch = WATCHLIST[i:i + BATCH_SIZE]
+    for i in range(0, len(watchlist), BATCH_SIZE):
+        batch = watchlist[i:i + BATCH_SIZE]
         raw = _fetch_batch(batch)
 
         for sym, bar_list in raw.items():
@@ -172,9 +248,7 @@ def fetch_data() -> dict:
             }).set_index("t").sort_index()
             frames[sym] = df[["Open", "High", "Low", "Close", "Volume"]]
 
-    missing = [s for s in WATCHLIST if s not in frames]
-    if missing:
-        log.info("لا توجد بيانات لـ: %s", ", ".join(missing))
+    log.info("تم جلب بيانات %d/%d رمز", len(frames), len(watchlist))
     return frames
 
 
@@ -271,7 +345,8 @@ def main() -> None:
     if not ALPACA_KEY_ID or not ALPACA_SECRET_KEY:
         raise SystemExit("ضع ALPACA_API_KEY_ID و ALPACA_API_SECRET_KEY في متغيرات البيئة")
 
-    send_telegram("✅ بوت زخم ناسداك اشتغل (مصدر البيانات: Alpaca/IEX). "
+    mode = "كل سوق ناسداك" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
+    send_telegram(f"✅ بوت زخم ناسداك اشتغل (مصدر البيانات: Alpaca/IEX، الفحص: {mode}). "
                   "سأنبهك عند ظهور زخم على الأسهم.")
     while True:
         try:
