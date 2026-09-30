@@ -290,7 +290,7 @@ def analyze(symbol: str, df: pd.DataFrame):
     breakout_up = price > float(prev["High"].max())
     breakout_down = price < float(prev["Low"].min())
 
-    if rvol >= RVOL_MIN and abs(change_pct) >= PRICE_CHANGE_MIN:
+    if rvol >= RVOL_MIN and change_pct >= PRICE_CHANGE_MIN:
         return {
             "symbol": symbol,
             "price": price,
@@ -303,16 +303,9 @@ def analyze(symbol: str, df: pd.DataFrame):
 
 
 def format_alert(s: dict) -> str:
-    up = s["change"] > 0
-    icon = "🚀" if up else "🔻"
-    direction = "صاعد" if up else "هابط"
-    extra = ""
-    if s["breakout_up"]:
-        extra = "\n💥 اختراق أعلى سعر لآخر 20 شمعة"
-    elif s["breakout_down"]:
-        extra = "\n⚠️ كسر أدنى سعر لآخر 20 شمعة"
+    extra = "\n💥 اختراق أعلى سعر لآخر 20 شمعة" if s["breakout_up"] else ""
     return (
-        f"{icon} <b>زخم {direction} على ${s['symbol']}</b>\n"
+        f"🚀 <b>زخم صاعد على ${s['symbol']}</b>\n"
         f"السعر: <b>{s['price']:.2f}$</b>\n"
         f"التغير (15 دقيقة): <b>{s['change']:+.2f}%</b>\n"
         f"الحجم النسبي (IEX): <b>{s['rvol']:.1f}x</b>"
