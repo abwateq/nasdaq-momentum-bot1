@@ -310,7 +310,7 @@ def format_alert(s: dict) -> str:
         f"التغير (15 دقيقة): <b>{s['change']:+.2f}%</b>\n"
         f"الحجم النسبي (IEX): <b>{s['rvol']:.1f}x</b>"
         f"{extra}\n"
-        f"https://finance.yahoo.com/quote/{s['symbol']}"
+        f""
     )
 
 
