@@ -42,7 +42,10 @@ ALPACA_KEY_ID = os.getenv("ALPACA_API_KEY_ID", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_API_SECRET_KEY", "")
 ALPACA_FEED = "iex"   # الخطة المجانية: iex فقط. الخطة المدفوعة: sip
 ALPACA_DATA_URL = "https://data.alpaca.markets/v2/stocks/bars"
-ALPACA_ASSETS_URL = "https://api.alpaca.markets/v2/assets"
+ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+ALPACA_TRADING_BASE = ("https://paper-api.alpaca.markets" if ALPACA_PAPER
+                        else "https://api.alpaca.markets")
+ALPACA_ASSETS_URL = f"{ALPACA_TRADING_BASE}/v2/assets"
 
 # فحص كل سوق ناسداك تلقائيًا بدل قائمة يدوية (True/False)
 SCAN_FULL_MARKET = os.getenv("SCAN_FULL_MARKET", "true").lower() == "true"
@@ -165,7 +168,12 @@ def fetch_nasdaq_symbols() -> list[str]:
     params = {"status": "active", "asset_class": "us_equity"}
     r = _alpaca_get(ALPACA_ASSETS_URL, params)
     if r is None:
-        log.warning("تعذر جلب قائمة رموز ناسداك، سأستخدم آخر نسخة محفوظة أو القائمة الاحتياطية")
+        log.warning(
+            "تعذر جلب قائمة رموز ناسداك من %s. إذا كان الخطأ 401/403، تأكد أن "
+            "ALPACA_PAPER يطابق نوع مفاتيحك (true لمفاتيح Paper، false لمفاتيح Live). "
+            "سأستخدم آخر نسخة محفوظة أو القائمة الاحتياطية الآن.",
+            ALPACA_ASSETS_URL,
+        )
         return _symbols_cache["symbols"] or FALLBACK_WATCHLIST
 
     assets = r.json()
