@@ -351,7 +351,7 @@ def format_alert(s: dict, news: dict | None) -> str:
         f"الحجم النسبي (IEX): <b>{s['rvol']:.1f}x</b>"
         f"{extra}"
         f"{news_block}\n\n"
-        f"https://finance.yahoo.com/quote/{s['symbol']}"
+       
     )
 
 
@@ -389,7 +389,7 @@ def main() -> None:
         raise SystemExit("ضع ALPACA_API_KEY_ID و ALPACA_API_SECRET_KEY في متغيرات البيئة")
 
     mode = "" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
-    send_telegram(f"✅ بوت زخم ناسداك اشتغل ( {mode}). "
+    send_telegram(f"✅ بوت زخم ناسداك اشتغل . "
                   "سأنبهك عند ظهور زخم على الأسهم.")
     while True:
         try:
