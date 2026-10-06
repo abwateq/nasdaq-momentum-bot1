@@ -396,7 +396,7 @@ def format_alert(s: dict, news: dict | None, float_shares: float | None) -> str:
         f"{float_line}"
         f"{extra}"
         f"{news_block}\n\n"
-        f"https://finance.yahoo.com/quote/{s['symbol']}"
+       
     )
 
 
@@ -434,8 +434,8 @@ def main() -> None:
     if not ALPACA_KEY_ID or not ALPACA_SECRET_KEY:
         raise SystemExit("ضع ALPACA_API_KEY_ID و ALPACA_API_SECRET_KEY في متغيرات البيئة")
 
-    mode = "كل سوق ناسداك" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
-    send_telegram(f"✅ بوت زخم ناسداك اشتغل (مصدر البيانات: Alpaca/IEX، الفحص: {mode}). "
+    mode = "" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
+    send_telegram(f"✅ بوت زخم ناسداك اشتغل . "
                   "سأنبهك عند ظهور زخم على الأسهم.")
     while True:
         try:
