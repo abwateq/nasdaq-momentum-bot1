@@ -56,7 +56,7 @@ CHECK_EVERY_SECONDS = 300      # فحص كل 5 دقائق
 RVOL_MIN = 3.0                 # الحجم لازم يكون 3 أضعاف المتوسط أو أكثر
 PRICE_CHANGE_MIN = 1.0         # حركة السعر % خلال آخر 15 دقيقة
 LOOKBACK_BARS = 20             # عدد الشموع لحساب المتوسط والاختراق
-MIN_PRICE = 2.0                # تجاهل الأسهم الأرخص من هذا السعر
+MIN_PRICE = 0.0                # تجاهل الأسهم الأرخص من هذا السعر
 MAX_PRICE = 7.0                 # تجاهل الأسهم الأغلى من هذا السعر
 COOLDOWN_MINUTES = 60          # لا تكرر تنبيه نفس السهم قبل هذه المدة
 NEWS_LOOKBACK_HOURS = 24       # يعرض الخبر فقط إذا نُشر خلال هذه المدة
@@ -388,8 +388,8 @@ def main() -> None:
     if not ALPACA_KEY_ID or not ALPACA_SECRET_KEY:
         raise SystemExit("ضع ALPACA_API_KEY_ID و ALPACA_API_SECRET_KEY في متغيرات البيئة")
 
-    mode = "كل سوق ناسداك" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
-    send_telegram(f"✅ بوت زخم ناسداك اشتغل (مصدر البيانات: Alpaca/IEX، الفحص: {mode}). "
+    mode = "" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
+    send_telegram(f"✅ بوت زخم ناسداك اشتغل ( {mode}). "
                   "سأنبهك عند ظهور زخم على الأسهم.")
     while True:
         try:
