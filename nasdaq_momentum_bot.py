@@ -56,7 +56,7 @@ CHECK_EVERY_SECONDS = 300      # فحص كل 5 دقائق
 RVOL_MIN = 3.0                 # الحجم لازم يكون 3 أضعاف المتوسط أو أكثر
 PRICE_CHANGE_MIN = 1.0         # حركة السعر % خلال آخر 15 دقيقة
 LOOKBACK_BARS = 20             # عدد الشموع لحساب المتوسط والاختراق
-MIN_PRICE = 0.0               # تجاهل الأسهم الأرخص من هذا السعر
+MIN_PRICE = 2.0                # تجاهل الأسهم الأرخص من هذا السعر
 MAX_PRICE = 7.0                 # تجاهل الأسهم الأغلى من هذا السعر
 COOLDOWN_MINUTES = 60          # لا تكرر تنبيه نفس السهم قبل هذه المدة
 NEWS_LOOKBACK_HOURS = 24       # يعرض الخبر فقط إذا نُشر خلال هذه المدة
@@ -336,12 +336,13 @@ def analyze(symbol: str, df: pd.DataFrame):
 def format_alert(s: dict, news: dict | None) -> str:
     extra = "\n💥 اختراق أعلى سعر لآخر 20 شمعة" if s["breakout_up"] else ""
 
-    news_block = ""
     if news and news.get("headline"):
         source = f" ({news['source']})" if news.get("source") else ""
         news_block = f"\n\n📰 <b>خبر{source}:</b> {news['headline']}"
         if news.get("url"):
             news_block += f"\n{news['url']}"
+    else:
+        news_block = "\n\n📰 لا توجد أخبار"
 
     return (
         f"🚀 <b>زخم صاعد على ${s['symbol']}</b>\n"
