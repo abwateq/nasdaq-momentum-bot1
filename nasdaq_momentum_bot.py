@@ -33,6 +33,14 @@ from zoneinfo import ZoneInfo
 
 import requests
 import pandas as pd
+import yfinance as yf
+
+# يُستخدم yfinance هنا فقط لجلب عدد الأسهم المطروحة (Float) عند حدوث تنبيه فعلي،
+# أي باستدعاءات قليلة جدًا، وليس لفحص السوق بالكامل.
+try:
+    yf.set_tz_cache_location("/tmp/py-yfinance-cache")
+except Exception:
+    pass
 
 # ===================== الإعدادات =====================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -56,10 +64,11 @@ CHECK_EVERY_SECONDS = 300      # فحص كل 5 دقائق
 RVOL_MIN = 3.0                 # الحجم لازم يكون 3 أضعاف المتوسط أو أكثر
 PRICE_CHANGE_MIN = 1.0         # حركة السعر % خلال آخر 15 دقيقة
 LOOKBACK_BARS = 20             # عدد الشموع لحساب المتوسط والاختراق
-MIN_PRICE = 0.0                # تجاهل الأسهم الأرخص من هذا السعر
+MIN_PRICE = 2.0                # تجاهل الأسهم الأرخص من هذا السعر
 MAX_PRICE = 7.0                 # تجاهل الأسهم الأغلى من هذا السعر
 COOLDOWN_MINUTES = 60          # لا تكرر تنبيه نفس السهم قبل هذه المدة
 NEWS_LOOKBACK_HOURS = 24       # يعرض الخبر فقط إذا نُشر خلال هذه المدة
+MIN_DAILY_VOLUME = 100_000     # تجاهل الأسهم التي حجم تداولها اليومي أقل من هذا
 BATCH_SIZE = 100               # عدد الأسهم في كل طلب لـ Alpaca
 
 # حماية من تجاوز حد الخطة المجانية (200 طلب/دقيقة) - نبقى تحته بهامش أمان
@@ -202,6 +211,28 @@ def fetch_nasdaq_symbols() -> list[str]:
     return symbols
 
 
+def fetch_float_shares(symbol: str) -> float | None:
+    """يجلب عدد الأسهم المطروحة للتداول (Float) عبر yfinance. يُستدعى فقط عند تنبيه فعلي."""
+    try:
+        t = yf.Ticker(symbol)
+        info = t.get_info()
+        float_shares = info.get("floatShares")
+        return float(float_shares) if float_shares else None
+    except Exception as e:
+        log.warning("تعذر جلب Float لـ %s: %s", symbol, e)
+        return None
+
+
+def _format_number(n: float) -> str:
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return f"{n:.0f}"
+
+
 def fetch_news(symbol: str) -> dict | None:
     """يجلب آخر خبر عن السهم إذا نُشر خلال آخر NEWS_LOOKBACK_HOURS ساعة، وإلا None."""
     params = {"symbols": symbol, "limit": 3, "sort": "desc", "include_content": "false"}
@@ -321,6 +352,14 @@ def analyze(symbol: str, df: pd.DataFrame):
     breakout_up = price > float(prev["High"].max())
     breakout_down = price < float(prev["Low"].min())
 
+    # حجم التداول التراكمي لليوم الحالي (بتوقيت نيويورك)
+    today_ny = df.index[-1].tz_convert(NY).date()
+    today_bars = df[df.index.tz_convert(NY).date == today_ny]
+    daily_volume = float(today_bars["Volume"].sum())
+
+    if daily_volume < MIN_DAILY_VOLUME:
+        return None
+
     if rvol >= RVOL_MIN and change_pct >= PRICE_CHANGE_MIN:
         return {
             "symbol": symbol,
@@ -329,12 +368,16 @@ def analyze(symbol: str, df: pd.DataFrame):
             "change": change_pct,
             "breakout_up": breakout_up,
             "breakout_down": breakout_down,
+            "daily_volume": daily_volume,
         }
     return None
 
 
-def format_alert(s: dict, news: dict | None) -> str:
+def format_alert(s: dict, news: dict | None, float_shares: float | None) -> str:
     extra = "\n💥 اختراق أعلى سعر لآخر 20 شمعة" if s["breakout_up"] else ""
+
+    float_line = (f"\nالأسهم المطروحة (Float): <b>{_format_number(float_shares)}</b>"
+                  if float_shares else "\nالأسهم المطروحة (Float): غير متوفر")
 
     if news and news.get("headline"):
         source = f" ({news['source']})" if news.get("source") else ""
@@ -348,10 +391,12 @@ def format_alert(s: dict, news: dict | None) -> str:
         f"🚀 <b>زخم صاعد على ${s['symbol']}</b>\n"
         f"السعر: <b>{s['price']:.2f}$</b>\n"
         f"التغير (15 دقيقة): <b>{s['change']:+.2f}%</b>\n"
-        f"الحجم النسبي (IEX): <b>{s['rvol']:.1f}x</b>"
+        f"الحجم النسبي (IEX): <b>{s['rvol']:.1f}x</b>\n"
+        f"حجم التداول اليومي: <b>{_format_number(s['daily_volume'])}</b>"
+        f"{float_line}"
         f"{extra}"
         f"{news_block}\n\n"
-       
+        f"https://finance.yahoo.com/quote/{s['symbol']}"
     )
 
 
@@ -374,7 +419,8 @@ def scan_once() -> None:
             continue
 
         news = fetch_news(symbol)
-        send_telegram(format_alert(result, news))
+        float_shares = fetch_float_shares(symbol)
+        send_telegram(format_alert(result, news, float_shares))
         last_alert[symbol] = now
         found += 1
         log.info("تنبيه: %s", symbol)
@@ -388,8 +434,8 @@ def main() -> None:
     if not ALPACA_KEY_ID or not ALPACA_SECRET_KEY:
         raise SystemExit("ضع ALPACA_API_KEY_ID و ALPACA_API_SECRET_KEY في متغيرات البيئة")
 
-    mode = "" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
-    send_telegram(f"✅ بوت زخم ناسداك اشتغل . "
+    mode = "كل سوق ناسداك" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
+    send_telegram(f"✅ بوت زخم ناسداك اشتغل (مصدر البيانات: Alpaca/IEX، الفحص: {mode}). "
                   "سأنبهك عند ظهور زخم على الأسهم.")
     while True:
         try:
