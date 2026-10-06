@@ -42,6 +42,7 @@ ALPACA_KEY_ID = os.getenv("ALPACA_API_KEY_ID", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_API_SECRET_KEY", "")
 ALPACA_FEED = "iex"   # الخطة المجانية: iex فقط. الخطة المدفوعة: sip
 ALPACA_DATA_URL = "https://data.alpaca.markets/v2/stocks/bars"
+ALPACA_NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
 ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 ALPACA_TRADING_BASE = ("https://paper-api.alpaca.markets" if ALPACA_PAPER
                         else "https://api.alpaca.markets")
@@ -56,7 +57,9 @@ RVOL_MIN = 3.0                 # الحجم لازم يكون 3 أضعاف ال�
 PRICE_CHANGE_MIN = 1.0         # حركة السعر % خلال آخر 15 دقيقة
 LOOKBACK_BARS = 20             # عدد الشموع لحساب المتوسط والاختراق
 MIN_PRICE = 2.0                # تجاهل الأسهم الأرخص من هذا السعر
+MAX_PRICE = 7.0                 # تجاهل الأسهم الأغلى من هذا السعر
 COOLDOWN_MINUTES = 60          # لا تكرر تنبيه نفس السهم قبل هذه المدة
+NEWS_LOOKBACK_HOURS = 24       # يعرض الخبر فقط إذا نُشر خلال هذه المدة
 BATCH_SIZE = 100               # عدد الأسهم في كل طلب لـ Alpaca
 
 # حماية من تجاوز حد الخطة المجانية (200 طلب/دقيقة) - نبقى تحته بهامش أمان
@@ -199,6 +202,34 @@ def fetch_nasdaq_symbols() -> list[str]:
     return symbols
 
 
+def fetch_news(symbol: str) -> dict | None:
+    """يجلب آخر خبر عن السهم إذا نُشر خلال آخر NEWS_LOOKBACK_HOURS ساعة، وإلا None."""
+    params = {"symbols": symbol, "limit": 3, "sort": "desc", "include_content": "false"}
+    r = _alpaca_get(ALPACA_NEWS_URL, params)
+    if r is None:
+        return None
+
+    items = (r.json() or {}).get("news", [])
+    if not items:
+        return None
+
+    latest = items[0]
+    try:
+        published = pd.to_datetime(latest["created_at"], utc=True).to_pydatetime()
+    except (KeyError, ValueError):
+        return None
+
+    age_hours = (datetime.now(ZoneInfo("UTC")) - published).total_seconds() / 3600
+    if age_hours > NEWS_LOOKBACK_HOURS:
+        return None
+
+    return {
+        "headline": latest.get("headline", "").strip(),
+        "url": latest.get("url", ""),
+        "source": latest.get("source", ""),
+    }
+
+
 def _fetch_batch(symbols: list[str]) -> dict:
     """يجلب شموع 5 دقائق لمجموعة أسهم من Alpaca، مع تصفّح next_page_token."""
     start = (datetime.utcnow() - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -276,7 +307,7 @@ def analyze(symbol: str, df: pd.DataFrame):
     last = df.iloc[-1]
     prev = df.iloc[-1 - LOOKBACK_BARS:-1]
     price = float(last["Close"])
-    if price < MIN_PRICE:
+    if price < MIN_PRICE or price > MAX_PRICE:
         return None
 
     avg_vol = float(prev["Volume"].mean())
@@ -302,15 +333,24 @@ def analyze(symbol: str, df: pd.DataFrame):
     return None
 
 
-def format_alert(s: dict) -> str:
+def format_alert(s: dict, news: dict | None) -> str:
     extra = "\n💥 اختراق أعلى سعر لآخر 20 شمعة" if s["breakout_up"] else ""
+
+    news_block = ""
+    if news and news.get("headline"):
+        source = f" ({news['source']})" if news.get("source") else ""
+        news_block = f"\n\n📰 <b>خبر{source}:</b> {news['headline']}"
+        if news.get("url"):
+            news_block += f"\n{news['url']}"
+
     return (
         f"🚀 <b>زخم صاعد على ${s['symbol']}</b>\n"
         f"السعر: <b>{s['price']:.2f}$</b>\n"
         f"التغير (15 دقيقة): <b>{s['change']:+.2f}%</b>\n"
         f"الحجم النسبي (IEX): <b>{s['rvol']:.1f}x</b>"
-        f"{extra}\n"
-        f""
+        f"{extra}"
+        f"{news_block}\n\n"
+        f"https://finance.yahoo.com/quote/{s['symbol']}"
     )
 
 
@@ -332,7 +372,8 @@ def scan_once() -> None:
         if last and (now - last).total_seconds() < COOLDOWN_MINUTES * 60:
             continue
 
-        send_telegram(format_alert(result))
+        news = fetch_news(symbol)
+        send_telegram(format_alert(result, news))
         last_alert[symbol] = now
         found += 1
         log.info("تنبيه: %s", symbol)
@@ -346,8 +387,8 @@ def main() -> None:
     if not ALPACA_KEY_ID or not ALPACA_SECRET_KEY:
         raise SystemExit("ضع ALPACA_API_KEY_ID و ALPACA_API_SECRET_KEY في متغيرات البيئة")
 
-    mode = "" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
-    send_telegram(f"✅ بوت زخم ناسداك اشتغل : {mode}). "
+    mode = "كل سوق ناسداك" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
+    send_telegram(f"✅ بوت زخم ناسداك اشتغل (مصدر البيانات: Alpaca/IEX، الفحص: {mode}). "
                   "سأنبهك عند ظهور زخم على الأسهم.")
     while True:
         try:
