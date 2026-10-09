@@ -51,6 +51,7 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_API_SECRET_KEY", "")
 ALPACA_FEED = "iex"   # الخطة المجانية: iex فقط. الخطة المدفوعة: sip
 ALPACA_DATA_URL = "https://data.alpaca.markets/v2/stocks/bars"
 ALPACA_NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
+ALPACA_SNAPSHOTS_URL = "https://data.alpaca.markets/v2/stocks/snapshots"
 ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 ALPACA_TRADING_BASE = ("https://paper-api.alpaca.markets" if ALPACA_PAPER
                         else "https://api.alpaca.markets")
@@ -60,11 +61,12 @@ ALPACA_ASSETS_URL = f"{ALPACA_TRADING_BASE}/v2/assets"
 SCAN_FULL_MARKET = os.getenv("SCAN_FULL_MARKET", "true").lower() == "true"
 SYMBOLS_REFRESH_HOURS = 24     # كل كم ساعة يُحدَّث سجل رموز ناسداك من Alpaca
 
-CHECK_EVERY_SECONDS = 300      # فحص كل 5 دقائق
+CHECK_EVERY_SECONDS = 60       # فحص كل دقيقة (يُحسب من بداية كل فحص وليس من نهايته)
+SNAPSHOT_BATCH_SIZE = 200      # عدد الأسهم في كل طلب Snapshots (للتصفية السريعة)
 RVOL_MIN = 3.0                 # الحجم لازم يكون 3 أضعاف المتوسط أو أكثر
 PRICE_CHANGE_MIN = 1.0         # حركة السعر % خلال آخر 15 دقيقة
 LOOKBACK_BARS = 20             # عدد الشموع لحساب المتوسط والاختراق
-MIN_PRICE = 0.0                # تجاهل الأسهم الأرخص من هذا السعر
+MIN_PRICE = 0.0                # الحد الأدنى للسعر (0 = كل الأسهم حتى MAX_PRICE)
 MAX_PRICE = 7.0                 # تجاهل الأسهم الأغلى من هذا السعر
 COOLDOWN_MINUTES = 60          # لا تكرر تنبيه نفس السهم قبل هذه المدة
 NEWS_LOOKBACK_HOURS = 24       # يعرض الخبر فقط إذا نُشر خلال هذه المدة
@@ -98,6 +100,16 @@ NY = ZoneInfo("America/New_York")
 MARKET_OPEN = dtime(9, 30)
 MARKET_CLOSE = dtime(16, 0)
 
+# تشغيل البوت قبل السوق وبعده (بتوقيت نيويورك: 4:00 صباحًا - 8:00 مساءً)
+INCLUDE_EXTENDED_HOURS = os.getenv("INCLUDE_EXTENDED_HOURS", "true").lower() == "true"
+PREMARKET_OPEN = dtime(4, 0)
+AFTERHOURS_CLOSE = dtime(20, 0)
+
+# في الجلسات الممتدة التداول متقطع، فنتجاهل السهم إذا كانت آخر شمعة قديمة
+MAX_BAR_AGE_MINUTES = 10
+# أقصى فجوة مسموحة بين آخر شمعة وشمعة المقارنة (قبل 15 دقيقة) عند حساب التغير
+MAX_REF_GAP_MINUTES = 60
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("momentum-bot")
 
@@ -105,8 +117,22 @@ last_alert: dict[str, datetime] = {}
 
 
 def market_is_open() -> bool:
+    """هل نحن داخل وقت الفحص؟ (يشمل قبل السوق وبعده إذا INCLUDE_EXTENDED_HOURS=true)"""
     now = datetime.now(NY)
-    return now.weekday() < 5 and MARKET_OPEN <= now.time() <= MARKET_CLOSE
+    if now.weekday() >= 5:
+        return False
+    start, end = ((PREMARKET_OPEN, AFTERHOURS_CLOSE) if INCLUDE_EXTENDED_HOURS
+                  else (MARKET_OPEN, MARKET_CLOSE))
+    return start <= now.time() <= end
+
+
+def session_label() -> str:
+    t = datetime.now(NY).time()
+    if t < MARKET_OPEN:
+        return "قبل السوق"
+    if t <= MARKET_CLOSE:
+        return "الجلسة الرسمية"
+    return "بعد السوق"
 
 
 def send_telegram(text: str) -> None:
@@ -261,9 +287,57 @@ def fetch_news(symbol: str) -> dict | None:
     }
 
 
+def _data_start() -> str:
+    """بداية جلب الشموع: الأبكر بين (قبل 12 ساعة) و(4:00 صباحًا اليوم بتوقيت نيويورك)،
+    لنغطي حجم اليوم كاملًا وشموع المقارنة بدون جلب يومين كاملين في كل فحص."""
+    now_ny = datetime.now(NY)
+    today_premarket = now_ny.replace(hour=4, minute=0, second=0, microsecond=0)
+    start = min(now_ny - timedelta(hours=12), today_premarket)
+    return start.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def filter_candidates(symbols: list[str]) -> list[str]:
+    """تصفية سريعة عبر Snapshots: نبقي فقط الأسهم ضمن نطاق السعر التي تداولت مؤخرًا.
+    هذا يقلل عدد الأسهم التي نجلب شموعها كل دقيقة من آلاف إلى مئات."""
+    candidates: list[str] = []
+    now_utc = datetime.now(ZoneInfo("UTC"))
+
+    for i in range(0, len(symbols), SNAPSHOT_BATCH_SIZE):
+        batch = symbols[i:i + SNAPSHOT_BATCH_SIZE]
+        r = _alpaca_get(ALPACA_SNAPSHOTS_URL,
+                        {"symbols": ",".join(batch), "feed": ALPACA_FEED})
+        if r is None:
+            # فشل التصفية لهذه الدفعة: نُبقي أسهمها كلها بدل أن نفوّت شيئًا
+            candidates.extend(batch)
+            continue
+
+        data = r.json() or {}
+        snaps = data.get("snapshots", data)
+        for sym in batch:
+            snap = snaps.get(sym)
+            if not snap:
+                continue
+            trade = snap.get("latestTrade") or {}
+            price = trade.get("p")
+            ts = trade.get("t")
+            if price is None or ts is None:
+                continue
+            if price < MIN_PRICE or price > MAX_PRICE:
+                continue
+            try:
+                trade_time = pd.to_datetime(ts, utc=True).to_pydatetime()
+            except ValueError:
+                continue
+            if (now_utc - trade_time) > timedelta(minutes=MAX_BAR_AGE_MINUTES + 5):
+                continue
+            candidates.append(sym)
+
+    return candidates
+
+
 def _fetch_batch(symbols: list[str]) -> dict:
     """يجلب شموع 5 دقائق لمجموعة أسهم من Alpaca، مع تصفّح next_page_token."""
-    start = (datetime.utcnow() - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    start = _data_start()
     params = {
         "symbols": ",".join(symbols),
         "timeframe": "5Min",
@@ -299,7 +373,9 @@ def _fetch_batch(symbols: list[str]) -> dict:
 
 def fetch_data() -> dict:
     """يجلب بيانات كل أسهم القائمة من Alpaca على دفعات، ويعيد dict: symbol -> DataFrame."""
-    watchlist = fetch_nasdaq_symbols() if SCAN_FULL_MARKET else FALLBACK_WATCHLIST
+    universe = fetch_nasdaq_symbols() if SCAN_FULL_MARKET else FALLBACK_WATCHLIST
+    watchlist = filter_candidates(universe)
+    log.info("المرشحون بعد التصفية السريعة: %d من %d", len(watchlist), len(universe))
     frames: dict[str, pd.DataFrame] = {}
 
     for i in range(0, len(watchlist), BATCH_SIZE):
@@ -328,14 +404,16 @@ def analyze(symbol: str, df: pd.DataFrame):
     if len(df) < LOOKBACK_BARS + 5:
         return None
 
-    # تجاهل الشمعة الأخيرة إذا لم تكتمل بعد
-    last_ts = df.index[-1].to_pydatetime()
-    if (datetime.now(NY) - last_ts).total_seconds() < 300:
-        df = df.iloc[:-1]
-        if len(df) < LOOKBACK_BARS + 5:
-            return None
-
+    # نحلل الشمعة الجارية (غير المكتملة) أيضًا لتقليل التأخير؛ حجمها جزئي،
+    # فإذا تجاوز شرط الحجم وهي لم تكتمل فالزخم حقيقي.
     last = df.iloc[-1]
+    last_bar_ts = df.index[-1]
+
+    # تجاهل السهم إذا لم يتداول مؤخرًا (مهم قبل/بعد السوق حيث التداول متقطع)
+    bar_age = datetime.now(NY) - last_bar_ts.to_pydatetime()
+    if bar_age > timedelta(minutes=MAX_BAR_AGE_MINUTES):
+        return None
+
     prev = df.iloc[-1 - LOOKBACK_BARS:-1]
     price = float(last["Close"])
     if price < MIN_PRICE or price > MAX_PRICE:
@@ -346,8 +424,17 @@ def analyze(symbol: str, df: pd.DataFrame):
         return None
     rvol = float(last["Volume"]) / avg_vol
 
-    price_3_bars_ago = float(df.iloc[-4]["Close"])
-    change_pct = (price / price_3_bars_ago - 1) * 100
+    # سعر المقارنة: آخر شمعة قبل 15 دقيقة أو أكثر من آخر شمعة (بالوقت وليس بالترتيب)
+    # (شمعة المقارنة يجب أن يكون إغلاقها قبل 15 دقيقة على الأقل من الآن)
+    now_utc = datetime.now(ZoneInfo("UTC"))
+    ref_cutoff = pd.Timestamp(now_utc - timedelta(minutes=15) - timedelta(minutes=5))
+    ref_bars = df[df.index <= ref_cutoff]
+    if ref_bars.empty:
+        return None
+    if last_bar_ts - ref_bars.index[-1] > timedelta(minutes=MAX_REF_GAP_MINUTES):
+        return None
+    price_ref = float(ref_bars.iloc[-1]["Close"])
+    change_pct = (price / price_ref - 1) * 100
 
     breakout_up = price > float(prev["High"].max())
     breakout_down = price < float(prev["Low"].min())
@@ -389,9 +476,10 @@ def format_alert(s: dict, news: dict | None, float_shares: float | None) -> str:
 
     return (
         f"🚀 <b>زخم صاعد على ${s['symbol']}</b>\n"
+        f"🕒 الجلسة: <b>{session_label()}</b>\n"
         f"السعر: <b>{s['price']:.2f}$</b>\n"
         f"التغير (15 دقيقة): <b>{s['change']:+.2f}%</b>\n"
-        f"الحجم النسبي (IEX): <b>{s['rvol']:.1f}x</b>\n"
+        f"الحجم النسبي : <b>{s['rvol']:.1f}x</b>\n"
         f"حجم التداول اليومي: <b>{_format_number(s['daily_volume'])}</b>"
         f"{float_line}"
         f"{extra}"
@@ -434,18 +522,21 @@ def main() -> None:
     if not ALPACA_KEY_ID or not ALPACA_SECRET_KEY:
         raise SystemExit("ضع ALPACA_API_KEY_ID و ALPACA_API_SECRET_KEY في متغيرات البيئة")
 
-    mode = "" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
+   
+mode = "" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
     send_telegram(f"✅ بوت زخم ناسداك اشتغل . "
                   "سأنبهك عند ظهور زخم على الأسهم.")
     while True:
+        started = time.time()
         try:
             if market_is_open():
                 scan_once()
+                log.info("استغرق الفحص %.1f ثانية", time.time() - started)
             else:
                 log.info("السوق مغلق")
         except Exception as e:  # لا نوقف البوت بسبب خطأ عابر
             log.exception("خطأ أثناء الفحص: %s", e)
-        time.sleep(CHECK_EVERY_SECONDS)
+        time.sleep(max(1.0, CHECK_EVERY_SECONDS - (time.time() - started)))
 
 
 if __name__ == "__main__":
