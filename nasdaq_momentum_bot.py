@@ -66,11 +66,14 @@ SNAPSHOT_BATCH_SIZE = 200      # عدد الأسهم في كل طلب Snapshots 
 RVOL_MIN = 3.0                 # الحجم لازم يكون 3 أضعاف المتوسط أو أكثر
 PRICE_CHANGE_MIN = 1.0         # حركة السعر % خلال آخر 15 دقيقة
 LOOKBACK_BARS = 20             # عدد الشموع لحساب المتوسط والاختراق
+MIN_HISTORY_BARS = 6           # أقل عدد شموع سابقة لحساب المتوسط (الأسهم الخاملة شموعها قليلة)
 MIN_PRICE = 0.0                # الحد الأدنى للسعر (0 = كل الأسهم حتى MAX_PRICE)
 MAX_PRICE = 7.0                 # تجاهل الأسهم الأغلى من هذا السعر
 COOLDOWN_MINUTES = 60          # لا تكرر تنبيه نفس السهم قبل هذه المدة
 NEWS_LOOKBACK_HOURS = 24       # يعرض الخبر فقط إذا نُشر خلال هذه المدة
-MIN_DAILY_VOLUME = 100_000     # تجاهل الأسهم التي حجم تداولها اليومي أقل من هذا
+# ملاحظة: هذا الحجم من بيانات IEX فقط (جزء صغير من الحجم الكلي)، لذلك 100 ألف هنا
+# تعادل حجمًا حقيقيًا أكبر بكثير. يمكن تغييره من Render عبر متغير MIN_DAILY_VOLUME.
+MIN_DAILY_VOLUME = int(os.getenv("MIN_DAILY_VOLUME", "100000"))
 BATCH_SIZE = 100               # عدد الأسهم في كل طلب لـ Alpaca
 
 # حماية من تجاوز حد الخطة المجانية (200 طلب/دقيقة) - نبقى تحته بهامش أمان
@@ -108,7 +111,7 @@ AFTERHOURS_CLOSE = dtime(20, 0)
 # في الجلسات الممتدة التداول متقطع، فنتجاهل السهم إذا كانت آخر شمعة قديمة
 MAX_BAR_AGE_MINUTES = 10
 # أقصى فجوة مسموحة بين آخر شمعة وشمعة المقارنة (قبل 15 دقيقة) عند حساب التغير
-MAX_REF_GAP_MINUTES = 60
+MAX_REF_GAP_MINUTES = 4320
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("momentum-bot")
@@ -292,7 +295,7 @@ def _data_start() -> str:
     لنغطي حجم اليوم كاملًا وشموع المقارنة بدون جلب يومين كاملين في كل فحص."""
     now_ny = datetime.now(NY)
     today_premarket = now_ny.replace(hour=4, minute=0, second=0, microsecond=0)
-    start = min(now_ny - timedelta(hours=12), today_premarket)
+    start = min(now_ny - timedelta(days=3), today_premarket)
     return start.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -401,7 +404,7 @@ def fetch_data() -> dict:
 def analyze(symbol: str, df: pd.DataFrame):
     """يرجع dict فيه تفاصيل الزخم أو None."""
     df = df.dropna()
-    if len(df) < LOOKBACK_BARS + 5:
+    if len(df) < MIN_HISTORY_BARS + 1:
         return None
 
     # نحلل الشمعة الجارية (غير المكتملة) أيضًا لتقليل التأخير؛ حجمها جزئي،
@@ -479,12 +482,12 @@ def format_alert(s: dict, news: dict | None, float_shares: float | None) -> str:
         f"🕒 الجلسة: <b>{session_label()}</b>\n"
         f"السعر: <b>{s['price']:.2f}$</b>\n"
         f"التغير (15 دقيقة): <b>{s['change']:+.2f}%</b>\n"
-        f"الحجم النسبي : <b>{s['rvol']:.1f}x</b>\n"
+        f"الحجم النسبي (IEX): <b>{s['rvol']:.1f}x</b>\n"
         f"حجم التداول اليومي: <b>{_format_number(s['daily_volume'])}</b>"
         f"{float_line}"
         f"{extra}"
         f"{news_block}\n\n"
-       
+        
     )
 
 
@@ -522,8 +525,9 @@ def main() -> None:
     if not ALPACA_KEY_ID or not ALPACA_SECRET_KEY:
         raise SystemExit("ضع ALPACA_API_KEY_ID و ALPACA_API_SECRET_KEY في متغيرات البيئة")
 
-    send_telegram("✅ بوت زخم ناسداك اشتغل. سأنبهك عند ظهور زخم على الأسهم.")
-    
+    mode = "" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
+    send_telegram(f"✅ بوت زخم ناسداك اشتغل (: ، : {mode}). "
+                  "سأنبهك عند ظهور زخم على الأسهم.")
     while True:
         started = time.time()
         try:
