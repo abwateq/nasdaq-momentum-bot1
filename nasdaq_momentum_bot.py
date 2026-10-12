@@ -526,7 +526,7 @@ def main() -> None:
         raise SystemExit("ضع ALPACA_API_KEY_ID و ALPACA_API_SECRET_KEY في متغيرات البيئة")
 
     mode = "" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
-    send_telegram(f"✅ بوت زخم ناسداك اشتغل (: ، : {mode}). "
+    send_telegram(f"✅ بوت زخم ناسداك اشتغل . "
                   "سأنبهك عند ظهور زخم على الأسهم.")
     while True:
         started = time.time()
