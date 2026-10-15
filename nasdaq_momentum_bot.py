@@ -27,7 +27,7 @@
     MIN_PRICE / MAX_PRICE   حدود السعر (MAX_PRICE افتراضي 20، والقيمة 0 = بدون حد)
     NEW_HIGH_BASIS    high = أعلى سعر خلال اليوم (افتراضي) | close = سعر الإغلاق
     INCLUDE_NEWS      true/false: إضافة آخر خبر لكل سهم (افتراضي false)
-    MAX_RESULTS       أقصى عدد أسهم تُعرض في الرسالة (افتراضي 40)
+    MAX_RESULTS       أقصى عدد رسائل أسهم في التشغيل الواحد (افتراضي 40)
     ALPACA_FEED       sip (افتراضي، ويتراجع تلقائيًا إلى iex إذا لم يُسمح به) | iex
 """
 
@@ -100,7 +100,8 @@ MAX_REQUESTS_PER_MINUTE = 170  # نبقى تحت حد الخطة المجاني�
 MIN_REQUEST_INTERVAL = 60.0 / MAX_REQUESTS_PER_MINUTE
 FLOAT_LOOKUP_LIMIT = 300       # أقصى عدد أسهم نبحث لها عن Float في التشغيل الواحد
 FLOAT_CACHE_DAYS = 7           # لا نعيد جلب Float لنفس السهم قبل هذه المدة
-MAX_RESULTS = int(_env_float("MAX_RESULTS", 40))
+MAX_RESULTS = int(_env_float("MAX_RESULTS", 40))   # أقصى عدد رسائل أسهم في التشغيل الواحد
+TELEGRAM_DELAY_SECONDS = 3.1   # فاصل بين الرسائل (حد تلجرام ~20 رسالة/دقيقة للقنوات)
 INCLUDE_NEWS = _env_bool("INCLUDE_NEWS", False)
 NEWS_LOOKBACK_HOURS = 48
 RUN_ON_START = _env_bool("RUN_ON_START", True)
@@ -132,15 +133,24 @@ log = logging.getLogger("screener-bot")
 
 
 # ---------------------------- تلجرام ----------------------------
+def _telegram_retry_after(r) -> float:
+    try:
+        return float(r.json().get("parameters", {}).get("retry_after", 5))
+    except Exception:
+        return 5.0
+
+
 def send_telegram(text: str) -> None:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+            "disable_web_page_preview": True}
     try:
-        r = requests.post(
-            url,
-            data={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-                  "disable_web_page_preview": True},
-            timeout=15,
-        )
+        r = requests.post(url, data=data, timeout=15)
+        if r.status_code == 429:  # تلجرام يطلب التمهل (كثرة الرسائل)
+            wait = _telegram_retry_after(r)
+            log.warning("Telegram 429: أنتظر %.0f ثانية ثم أعيد الإرسال.", wait)
+            time.sleep(wait + 1)
+            r = requests.post(url, data=data, timeout=15)
         if r.status_code == 400 and "parse entities" in r.text:
             log.warning("Telegram رفض تنسيق HTML، سأعيد الإرسال كنص عادي.")
             plain = html.unescape(re.sub(r"</?b>", "", text))
@@ -442,83 +452,52 @@ def apply_float_filter(candidates: list[dict]) -> tuple[list[dict], int, bool]:
 
 
 # ---------------------------- الرسائل ----------------------------
-def criteria_text() -> str:
-    if FLOAT_MODE == "max":
-        float_txt = f"Float < {_format_number(FLOAT_LIMIT)}"
-    elif FLOAT_MODE == "min":
-        float_txt = f"Float > {_format_number(FLOAT_LIMIT)}"
-    else:
-        float_txt = "بدون فلتر Float"
-    parts = [
-        "أداء أسبوعي ↑",
-        f"فوق SMA{SMA_SHORT} و SMA{SMA_LONG}",
-        f"قمة جديدة {HIGH_DAYS} يومًا",
-        f"RVOL > {RVOL_MIN:g}",
-        f"حجم > {_format_number(MIN_VOLUME)}",
-        float_txt,
-    ]
-    if MAX_PRICE:
-        parts.append(f"السعر < {MAX_PRICE:g}$")
-    if MIN_PRICE:
-        parts.append(f"السعر ≥ {MIN_PRICE:g}$")
-    return html.escape(" | ".join(parts))   # تهريب < و > حتى لا يعتبرها تلجرام وسومًا
-
-
-def _format_line(i: int, s: dict) -> str:
-    fl = _format_number(s["float"]) if s.get("float") else "—"
-    line = (f"{i}. <b>${s['symbol']}</b>  {s['price']:.2f}$  |  أسبوع {s['week_perf']:+.1f}%  |  "
-            f"RVOL {s['rvol']:.1f}x  |  حجم {_format_number(s['volume'])}  |  Float {fl}")
+def _format_stock_message(s: dict) -> str:
+    """رسالة مستقلة لكل سهم."""
+    fl = _format_number(s["float"]) if s.get("float") else "غير متوفر"
+    msg = (
+        f"📊 <b>${s['symbol']}</b>\n"
+        f"السعر: <b>{s['price']:.2f}$</b>\n"
+        f"الأداء الأسبوعي: <b>{s['week_perf']:+.1f}%</b>\n"
+        f"الحجم النسبي: <b>{s['rvol']:.1f}x</b>\n"
+        f"حجم التداول: <b>{_format_number(s['volume'])}</b>\n"
+        f"الأسهم الحرة (Float): <b>{fl}</b>\n"
+        f"SMA{SMA_SHORT}: {s['sma20']:.2f}$ | SMA{SMA_LONG}: {s['sma50']:.2f}$"
+    )
+    if _feed == "iex":
+        msg += "\n⚠️ الحجم من بيانات IEX فقط (أقل من الحقيقي)"
     if INCLUDE_NEWS:
         news = fetch_news(s["symbol"])
         if news and news.get("headline"):
             src = f" ({html.escape(news['source'])})" if news.get("source") else ""
-            line += f"\n    📰{src} {html.escape(news['headline'])}"
+            msg += f"\n\n📰{src} {html.escape(news['headline'])}"
         else:
-            line += "\n    📰 لا توجد أخبار"
-    return line
-
-
-def _chunk(header: str, lines: list[str], limit: int = 3800) -> list[str]:
-    msgs: list[str] = []
-    cur = header
-    for line in lines:
-        if len(cur) + len(line) + 1 > limit:
-            msgs.append(cur)
-            cur = line
-        else:
-            cur = f"{cur}\n{line}" if cur else line
-    if cur:
-        msgs.append(cur)
-    return msgs
+            msg += "\n\n📰 لا توجد أخبار"
+    msg += f"\nhttps://finance.yahoo.com/quote/{s['symbol']}"
+    return msg
 
 
 def send_results(final: list[dict], analyzed: int, unknown_float: int,
                  truncated: bool, last_date) -> None:
-    header = [
-        "📊 <b>نتيجة فلتر الأسهم الأمريكية</b>",
-        f"📅 آخر شمعة يومية: {last_date}" if last_date else "",
-        f"✅ الأسهم المطابقة: <b>{len(final)}</b> (من {analyzed} سهم تم فحصه)",
-        f"🔎 {criteria_text()}",
-    ]
+    """يرسل كل سهم مطابق في رسالة منفصلة. التفاصيل الإضافية تُكتب في الـ Logs."""
+    log.info("آخر شمعة يومية: %s | فُحص %d سهم | مطابق: %d", last_date, analyzed, len(final))
     if _feed == "iex":
-        header.append("⚠️ البيانات من IEX فقط: الحجم أقل من الحقيقي، فقد يُستبعد سهم مؤهل بسبب شرط الحجم.")
+        log.warning("البيانات من IEX فقط: حجم التداول أقل من الحقيقي وقد يستبعد أسهمًا مؤهلة.")
     if unknown_float:
-        header.append(f"ℹ️ استُبعد {unknown_float} سهم لتعذر معرفة Float له.")
+        log.info("استُبعد %d سهم لتعذر معرفة Float له.", unknown_float)
     if truncated:
-        header.append(f"ℹ️ فُحص Float لأول {FLOAT_LOOKUP_LIMIT} سهم فقط (مرتبة حسب RVOL).")
-    header_text = "\n".join(h for h in header if h)
+        log.info("فُحص Float لأول %d سهم فقط (مرتبة حسب RVOL).", FLOAT_LOOKUP_LIMIT)
 
     if not final:
-        send_telegram(header_text + "\n\nلا توجد أسهم تطابق كل الفلاتر.")
+        send_telegram("لا توجد أسهم تطابق الفلاتر.")
         return
 
     shown = final[:MAX_RESULTS]
+    for s in shown:
+        send_telegram(_format_stock_message(s))
+        time.sleep(TELEGRAM_DELAY_SECONDS)   # تلجرام يحدد عدد الرسائل في الدقيقة
     if len(final) > len(shown):
-        header_text += f"\n(يُعرض أعلى {len(shown)} حسب الحجم النسبي)"
-    lines = [_format_line(i, s) for i, s in enumerate(shown, 1)]
-    for msg in _chunk(header_text + "\n", lines):
-        send_telegram(msg)
-        time.sleep(0.5)
+        send_telegram(f"ℹ️ يوجد {len(final) - len(shown)} سهم مطابق إضافي لم يُرسل (الحد الأقصى {MAX_RESULTS} رسالة).")
 
 
 # ---------------------------- التشغيل ----------------------------
@@ -574,12 +553,7 @@ def main() -> None:
     if not ALPACA_KEY_ID or not ALPACA_SECRET_KEY:
         raise SystemExit("ضع ALPACA_API_KEY_ID و ALPACA_API_SECRET_KEY في متغيرات البيئة")
 
-    times_txt = ", ".join(t.strftime("%H:%M") for t in SCREEN_TIMES)
-    send_telegram(
-        "✅ بوت فلتر الأسهم الأمريكية اشتغل.\n"
-        f"🔎 {criteria_text()}\n"
-        f"⏰ يعمل كل يوم تداول عند {times_txt} (بتوقيت نيويورك)."
-    )
+    send_telegram("فلتر الأسهم الأمريكية")
 
     ran: set = set()
     if RUN_ON_START:
