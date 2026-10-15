@@ -1,32 +1,39 @@
 """
-بوت تلجرام لتنبيهك عند وجود زخم (Momentum) على أسهم ناسداك
-مصدر البيانات: Alpaca Market Data API (الخطة المجانية - بيانات IEX اللحظية)
-------------------------------------------------------------
+فلتر الأسهم الأمريكية (Screener) - يرسل النتائج إلى تلجرام
+----------------------------------------------------------
+الفلاتر (على الشموع اليومية):
+    1. الأداء: ارتفاع خلال أسبوع (آخر إغلاق أعلى من إغلاق قبل 5 أيام تداول)
+    2. السعر أعلى من المتوسط المتحرك 20
+    3. السعر أعلى من المتوسط المتحرك 50
+    4. تسجيل أعلى سعر جديد خلال 20 يومًا
+    5. الحجم النسبي (RVOL) أعلى من 1
+    6. حجم التداول أكثر من 500,000
+    7. الأسهم الحرة للتداول (Float): أقل من 100 مليون سهم (قابل للتغيير، انظر FLOAT_MODE)
+    8. السعر أقل من 20 دولار (قابل للتغيير عبر MAX_PRICE)
+
 التثبيت:
-    pip install requests pandas
+    pip install requests pandas yfinance
 
-الإعداد (متغيرات بيئة):
-    export TELEGRAM_BOT_TOKEN="123456:ABC..."     # من @BotFather
-    export TELEGRAM_CHAT_ID="123456789"           # رقمك من @userinfobot
-    export ALPACA_API_KEY_ID="PK..."              # من لوحة Alpaca
-    export ALPACA_API_SECRET_KEY="..."            # من لوحة Alpaca
+متغيرات البيئة المطلوبة:
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY
 
-التشغيل:
-    python nasdaq_momentum_bot.py
-
-منطق الزخم (على شموع 5 دقائق):
-    - حجم التداول النسبي (RVOL): حجم آخر شمعة / متوسط آخر 20 شمعة
-    - تغير السعر خلال آخر 15 دقيقة (3 شموع)
-    - اختراق أعلى/أقل سعر لآخر 20 شمعة
-    يُرسل التنبيه إذا تحقق شرط الحجم + شرط السعر معًا.
-
-ملاحظة: الخطة المجانية من Alpaca تعطي بيانات من بورصة IEX فقط (وليس كل
-البورصات)، لذلك أرقام الحجم أقل من الحجم الفعلي الكلي في السوق، لكنها
-تبقى مفيدة لحساب "الحجم النسبي" (نسبة إلى متوسط نفس المصدر).
+متغيرات اختيارية (كلها لها قيم افتراضية):
+    FLOAT_MODE        max = أقل من الحد (افتراضي) | min = أكبر من الحد | off = بدون فلتر
+    FLOAT_LIMIT       الحد بالأسهم (افتراضي 100000000)
+    MIN_VOLUME        أقل حجم تداول (افتراضي 500000)
+    SCREEN_TIMES      أوقات التشغيل اليومية بتوقيت نيويورك، مفصولة بفاصلة (افتراضي 16:30)
+    RUN_ON_START      true/false: تشغيل فلتر فور بدء البوت (افتراضي true)
+    EXCHANGES         البورصات (افتراضي NASDAQ,NYSE,AMEX)
+    MIN_PRICE / MAX_PRICE   حدود السعر (MAX_PRICE افتراضي 20، والقيمة 0 = بدون حد)
+    NEW_HIGH_BASIS    high = أعلى سعر خلال اليوم (افتراضي) | close = سعر الإغلاق
+    INCLUDE_NEWS      true/false: إضافة آخر خبر لكل سهم (افتراضي false)
+    MAX_RESULTS       أقصى عدد أسهم تُعرض في الرسالة (افتراضي 40)
+    ALPACA_FEED       sip (افتراضي، ويتراجع تلقائيًا إلى iex إذا لم يُسمح به) | iex
 """
 
 import os
 import time
+import html
 import logging
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
@@ -35,12 +42,22 @@ import requests
 import pandas as pd
 import yfinance as yf
 
-# يُستخدم yfinance هنا فقط لجلب عدد الأسهم المطروحة (Float) عند حدوث تنبيه فعلي،
-# أي باستدعاءات قليلة جدًا، وليس لفحص السوق بالكامل.
 try:
     yf.set_tz_cache_location("/tmp/py-yfinance-cache")
 except Exception:
     pass
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except ValueError:
+        return float(default)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+
 
 # ===================== الإعدادات =====================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -48,96 +65,72 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 ALPACA_KEY_ID = os.getenv("ALPACA_API_KEY_ID", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_API_SECRET_KEY", "")
-ALPACA_FEED = "iex"   # الخطة المجانية: iex فقط. الخطة المدفوعة: sip
+ALPACA_PAPER = _env_bool("ALPACA_PAPER", True)
+ALPACA_FEED_PREFERRED = os.getenv("ALPACA_FEED", "sip").strip().lower()
+
 ALPACA_DATA_URL = "https://data.alpaca.markets/v2/stocks/bars"
 ALPACA_NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
-ALPACA_SNAPSHOTS_URL = "https://data.alpaca.markets/v2/stocks/snapshots"
-ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 ALPACA_TRADING_BASE = ("https://paper-api.alpaca.markets" if ALPACA_PAPER
                         else "https://api.alpaca.markets")
 ALPACA_ASSETS_URL = f"{ALPACA_TRADING_BASE}/v2/assets"
 
-# فحص كل سوق ناسداك تلقائيًا بدل قائمة يدوية (True/False)
-SCAN_FULL_MARKET = os.getenv("SCAN_FULL_MARKET", "true").lower() == "true"
-SYMBOLS_REFRESH_HOURS = 24     # كل كم ساعة يُحدَّث سجل رموز ناسداك من Alpaca
+# الأسهم الأمريكية: البورصات المشمولة (بدون OTC. وبدون ARCA لتفادي صناديق ETF)
+EXCHANGES = {e.strip().upper()
+             for e in os.getenv("EXCHANGES", "NASDAQ,NYSE,AMEX").split(",") if e.strip()}
 
-CHECK_EVERY_SECONDS = 60       # فحص كل دقيقة (يُحسب من بداية كل فحص وليس من نهايته)
-SNAPSHOT_BATCH_SIZE = 200      # عدد الأسهم في كل طلب Snapshots (للتصفية السريعة)
-RVOL_MIN = 3.0                 # الحجم لازم يكون 3 أضعاف المتوسط أو أكثر
-PRICE_CHANGE_MIN = 1.0         # حركة السعر % خلال آخر 15 دقيقة
-LOOKBACK_BARS = 20             # عدد الشموع لحساب المتوسط والاختراق
-MIN_HISTORY_BARS = 6           # أقل عدد شموع سابقة لحساب المتوسط (الأسهم الخاملة شموعها قليلة)
-MIN_PRICE = 0.0                # الحد الأدنى للسعر (0 = كل الأسهم حتى MAX_PRICE)
-MAX_PRICE = 7.0                 # تجاهل الأسهم الأغلى من هذا السعر
-COOLDOWN_MINUTES = 60          # لا تكرر تنبيه نفس السهم قبل هذه المدة
-NEWS_LOOKBACK_HOURS = 24       # يعرض الخبر فقط إذا نُشر خلال هذه المدة
-# ملاحظة: هذا الحجم من بيانات IEX فقط (جزء صغير من الحجم الكلي)، لذلك 100 ألف هنا
-# تعادل حجمًا حقيقيًا أكبر بكثير. يمكن تغييره من Render عبر متغير MIN_DAILY_VOLUME.
-MIN_DAILY_VOLUME = int(os.getenv("MIN_DAILY_VOLUME", "100000"))
-BATCH_SIZE = 100               # عدد الأسهم في كل طلب لـ Alpaca
+# ---------- الفلاتر ----------
+WEEK_PERF_MIN_PCT = 0.0                        # الأداء الأسبوعي أكبر من هذه النسبة %
+SMA_SHORT = 20                                 # المتوسط القصير
+SMA_LONG = 50                                  # المتوسط الطويل
+HIGH_DAYS = 20                                 # قمة جديدة خلال كم يوم
+NEW_HIGH_BASIS = os.getenv("NEW_HIGH_BASIS", "high").strip().lower()   # high | close
+RVOL_MIN = 1.0                                 # الحجم النسبي أكبر من
+RVOL_DAYS = 20                                 # متوسط الحجم لكم يوم سابق
+MIN_VOLUME = int(_env_float("MIN_VOLUME", 500_000))   # حجم التداول أكثر من
+FLOAT_MODE = os.getenv("FLOAT_MODE", "max").strip().lower()   # max | min | off
+FLOAT_LIMIT = int(_env_float("FLOAT_LIMIT", 100_000_000))
+MIN_PRICE = _env_float("MIN_PRICE", 0.0)       # 0 = بدون حد أدنى
+MAX_PRICE = _env_float("MAX_PRICE", 20.0)      # السعر أقل من هذا (0 = بدون حد أعلى)
+# -----------------------------
 
-# حماية من تجاوز حد الخطة المجانية (200 طلب/دقيقة) - نبقى تحته بهامش أمان
-MAX_REQUESTS_PER_MINUTE = 170
+HISTORY_DAYS = 130             # أيام تقويمية من التاريخ (تكفي لـ 50 يوم تداول وأكثر)
+BATCH_SIZE = 100               # عدد الأسهم في كل طلب
+MAX_REQUESTS_PER_MINUTE = 170  # نبقى تحت حد الخطة المجانية (200)
 MIN_REQUEST_INTERVAL = 60.0 / MAX_REQUESTS_PER_MINUTE
-
-# قائمة احتياطية تُستخدم فقط إذا SCAN_FULL_MARKET=False (تغطي تقريبًا ناسداك 100 + أسهم نشطة)
-FALLBACK_WATCHLIST = [
-    # ناسداك 100 (تقريبًا)
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "GOOG", "META", "TSLA", "AVGO", "COST",
-    "NFLX", "AMD", "ADBE", "PEP", "CSCO", "TMUS", "INTC", "QCOM", "INTU", "AMAT",
-    "TXN", "CMCSA", "AMGN", "HON", "BKNG", "ISRG", "SBUX", "GILD", "ADI", "VRTX",
-    "MU", "LRCX", "PANW", "REGN", "MDLZ", "KLAC", "SNPS", "CDNS", "ASML", "PYPL",
-    "MELI", "CRWD", "ABNB", "MAR", "ORLY", "FTNT", "MRVL", "ADSK", "WDAY", "DASH",
-    "TEAM", "CTAS", "PCAR", "PAYX", "ROP", "NXPI", "MNST", "CHTR", "KDP", "AEP",
-    "ODFL", "FAST", "EA", "EXC", "CSGP", "XEL", "CCEP", "CTSH", "DXCM", "BIIB",
-    "IDXX", "ON", "GEHC", "VRSK", "FANG", "ANSS", "ZS", "TTD", "CDW", "DDOG",
-    "ROST", "BKR", "GFS", "WBD", "ILMN", "MRNA", "LULU", "WBA", "SIRI", "EBAY",
-    "ALGN", "ENPH", "SGEN", "JD", "PDD",
-    # أسهم نشطة إضافية خارج المؤشر
-    "PLTR", "ARM", "COIN", "SMCI", "MSTR", "APP", "RIVN", "LCID", "SOFI", "AFRM",
-    "UPST", "RIOT", "MARA", "CVNA", "DKNG", "RBLX", "NIO", "SNOW", "NET", "SHOP",
-]
-# =====================================================
+FLOAT_LOOKUP_LIMIT = 300       # أقصى عدد أسهم نبحث لها عن Float في التشغيل الواحد
+FLOAT_CACHE_DAYS = 7           # لا نعيد جلب Float لنفس السهم قبل هذه المدة
+MAX_RESULTS = int(_env_float("MAX_RESULTS", 40))
+INCLUDE_NEWS = _env_bool("INCLUDE_NEWS", False)
+NEWS_LOOKBACK_HOURS = 48
+RUN_ON_START = _env_bool("RUN_ON_START", True)
+SYMBOLS_REFRESH_HOURS = 24
 
 NY = ZoneInfo("America/New_York")
-MARKET_OPEN = dtime(9, 30)
-MARKET_CLOSE = dtime(16, 0)
+UTC = ZoneInfo("UTC")
 
-# تشغيل البوت قبل السوق وبعده (بتوقيت نيويورك: 4:00 صباحًا - 8:00 مساءً)
-INCLUDE_EXTENDED_HOURS = os.getenv("INCLUDE_EXTENDED_HOURS", "true").lower() == "true"
-PREMARKET_OPEN = dtime(4, 0)
-AFTERHOURS_CLOSE = dtime(20, 0)
 
-# في الجلسات الممتدة التداول متقطع، فنتجاهل السهم إذا كانت آخر شمعة قديمة
-MAX_BAR_AGE_MINUTES = 10
-# أقصى فجوة مسموحة بين آخر شمعة وشمعة المقارنة (قبل 15 دقيقة) عند حساب التغير
-MAX_REF_GAP_MINUTES = 4320
+def _parse_times(raw: str) -> list[dtime]:
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            h, m = part.split(":")
+            out.append(dtime(int(h), int(m)))
+        except ValueError:
+            pass
+    return out or [dtime(16, 30)]
+
+
+SCREEN_TIMES = _parse_times(os.getenv("SCREEN_TIMES", "16:30"))
+# =====================================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log = logging.getLogger("momentum-bot")
-
-last_alert: dict[str, datetime] = {}
+log = logging.getLogger("screener-bot")
 
 
-def market_is_open() -> bool:
-    """هل نحن داخل وقت الفحص؟ (يشمل قبل السوق وبعده إذا INCLUDE_EXTENDED_HOURS=true)"""
-    now = datetime.now(NY)
-    if now.weekday() >= 5:
-        return False
-    start, end = ((PREMARKET_OPEN, AFTERHOURS_CLOSE) if INCLUDE_EXTENDED_HOURS
-                  else (MARKET_OPEN, MARKET_CLOSE))
-    return start <= now.time() <= end
-
-
-def session_label() -> str:
-    t = datetime.now(NY).time()
-    if t < MARKET_OPEN:
-        return "قبل السوق"
-    if t <= MARKET_CLOSE:
-        return "الجلسة الرسمية"
-    return "بعد السوق"
-
-
+# ---------------------------- تلجرام ----------------------------
 def send_telegram(text: str) -> None:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
@@ -150,12 +143,23 @@ def send_telegram(text: str) -> None:
         if not r.ok:
             log.warning("Telegram error: %s", r.text)
             if r.status_code == 403:
-                log.warning("تأكد أن TELEGRAM_CHAT_ID هو رقمك أنت (من @userinfobot) "
-                            "وليس رقم البوت، وأنك أرسلت رسالة للبوت أولًا.")
+                log.warning("تأكد أن TELEGRAM_CHAT_ID صحيح وأن البوت مشرف في القناة "
+                            "(أو أنك أرسلت له رسالة إذا كانت محادثة خاصة).")
     except requests.RequestException as e:
         log.warning("Telegram request failed: %s", e)
 
 
+def _format_number(n: float) -> str:
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return f"{n:.0f}"
+
+
+# ---------------------------- Alpaca ----------------------------
 def _alpaca_headers() -> dict:
     return {
         "APCA-API-KEY-ID": ALPACA_KEY_ID,
@@ -166,10 +170,11 @@ def _alpaca_headers() -> dict:
 _last_request_time = 0.0
 
 
-def _alpaca_get(url: str, params: dict):
-    """طلب GET لـ Alpaca مع احترام حد الطلبات بالدقيقة وإعادة محاولة عند 429."""
+def _alpaca_get(url: str, params: dict, raw_errors: bool = False):
+    """طلب GET لـ Alpaca مع احترام حد الطلبات وإعادة محاولة عند 429.
+    raw_errors=True: يرجع الرد حتى لو كان خطأ (ليفحصه المستدعي)."""
     global _last_request_time
-    for attempt in range(5):
+    for _ in range(5):
         wait = MIN_REQUEST_INTERVAL - (time.time() - _last_request_time)
         if wait > 0:
             time.sleep(wait)
@@ -187,10 +192,9 @@ def _alpaca_get(url: str, params: dict):
             time.sleep(retry_after)
             continue
 
-        if not r.ok:
+        if not r.ok and not raw_errors:
             log.warning("خطأ Alpaca (%d): %s", r.status_code, r.text[:300])
             return None
-
         return r
     return None
 
@@ -198,325 +202,361 @@ def _alpaca_get(url: str, params: dict):
 _symbols_cache: dict = {"symbols": [], "fetched_at": None}
 
 
-def fetch_nasdaq_symbols() -> list[str]:
-    """يجلب كل رموز ناسداك القابلة للتداول من Alpaca، مع تخزين مؤقت يوميًا."""
+def fetch_us_symbols() -> list[str]:
+    """كل رموز الأسهم الأمريكية القابلة للتداول في البورصات المحددة (تخزين مؤقت يومي)."""
     now = datetime.now()
-    if (_symbols_cache["fetched_at"]
-            and (now - _symbols_cache["fetched_at"]).total_seconds() < SYMBOLS_REFRESH_HOURS * 3600
-            and _symbols_cache["symbols"]):
+    fetched_at = _symbols_cache["fetched_at"]
+    if (fetched_at and _symbols_cache["symbols"]
+            and (now - fetched_at).total_seconds() < SYMBOLS_REFRESH_HOURS * 3600):
         return _symbols_cache["symbols"]
 
-    params = {"status": "active", "asset_class": "us_equity"}
-    r = _alpaca_get(ALPACA_ASSETS_URL, params)
+    r = _alpaca_get(ALPACA_ASSETS_URL, {"status": "active", "asset_class": "us_equity"})
     if r is None:
         log.warning(
-            "تعذر جلب قائمة رموز ناسداك من %s. إذا كان الخطأ 401/403، تأكد أن "
-            "ALPACA_PAPER يطابق نوع مفاتيحك (true لمفاتيح Paper، false لمفاتيح Live). "
-            "سأستخدم آخر نسخة محفوظة أو القائمة الاحتياطية الآن.",
-            ALPACA_ASSETS_URL,
-        )
-        return _symbols_cache["symbols"] or FALLBACK_WATCHLIST
+            "تعذر جلب قائمة الأسهم من %s. إذا كان الخطأ 401/403 تأكد أن ALPACA_PAPER "
+            "يطابق نوع مفاتيحك (true لمفاتيح Paper، false لمفاتيح Live).",
+            ALPACA_ASSETS_URL)
+        return _symbols_cache["symbols"]
 
-    assets = r.json()
     symbols = []
-    for a in assets:
-        if a.get("exchange") != "NASDAQ":
+    for a in r.json():
+        if a.get("exchange", "").upper() not in EXCHANGES:
             continue
         if not a.get("tradable"):
             continue
         sym = a.get("symbol", "")
-        # تجاهل الرموز غير القياسية (تفضيلية/وارنتس/وحدات) لتقليل الضجيج
+        # تجاهل الرموز غير القياسية (تفضيلية/وارنتس/وحدات)
         if not sym.isalpha() or len(sym) > 5:
             continue
         symbols.append(sym)
 
-    if not symbols:
-        log.warning("قائمة الرموز الراجعة من Alpaca فارغة، سأستخدم القائمة الاحتياطية")
-        return FALLBACK_WATCHLIST
-
-    _symbols_cache["symbols"] = symbols
-    _symbols_cache["fetched_at"] = now
-    log.info("تم تحديث قائمة رموز ناسداك: %d رمز", len(symbols))
+    if symbols:
+        _symbols_cache["symbols"] = symbols
+        _symbols_cache["fetched_at"] = now
+        log.info("قائمة الأسهم: %d رمز من %s", len(symbols), ", ".join(sorted(EXCHANGES)))
     return symbols
 
 
-def fetch_float_shares(symbol: str) -> float | None:
-    """يجلب عدد الأسهم المطروحة للتداول (Float) عبر yfinance. يُستدعى فقط عند تنبيه فعلي."""
-    try:
-        t = yf.Ticker(symbol)
-        info = t.get_info()
-        float_shares = info.get("floatShares")
-        return float(float_shares) if float_shares else None
-    except Exception as e:
-        log.warning("تعذر جلب Float لـ %s: %s", symbol, e)
-        return None
+_feed = ALPACA_FEED_PREFERRED if ALPACA_FEED_PREFERRED in ("sip", "iex") else "sip"
 
 
-def _format_number(n: float) -> str:
-    if n >= 1_000_000_000:
-        return f"{n / 1_000_000_000:.2f}B"
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.2f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return f"{n:.0f}"
+def _fetch_daily_batch(symbols: list[str]) -> dict:
+    """يجلب الشموع اليومية لمجموعة أسهم. يجرب SIP أولًا ثم يتراجع إلى IEX عند الرفض."""
+    global _feed
+    start = (datetime.now(UTC) - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    for _attempt in range(2):
+        params = {
+            "symbols": ",".join(symbols),
+            "timeframe": "1Day",
+            "start": start,
+            "limit": 10000,
+            "feed": _feed,
+            "adjustment": "split",
+            "sort": "asc",
+        }
+        if _feed == "sip":
+            # الخطة المجانية لا تسمح باستعلام بيانات SIP الأحدث من 15 دقيقة
+            params["end"] = (datetime.now(UTC) - timedelta(minutes=16)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        all_bars: dict[str, list] = {s: [] for s in symbols}
+        page_token = None
+        switched = False
+
+        for _page in range(10):
+            if page_token:
+                params["page_token"] = page_token
+            r = _alpaca_get(ALPACA_DATA_URL, params, raw_errors=True)
+            if r is None:
+                return all_bars
+            if not r.ok:
+                if _feed == "sip" and r.status_code in (400, 401, 403, 422):
+                    log.warning("Alpaca رفض بيانات SIP (%d): %s", r.status_code, r.text[:200])
+                    log.warning("سأتحول إلى بيانات IEX. تنبيه: حجم IEX أقل بكثير من الحجم الحقيقي.")
+                    _feed = "iex"
+                    switched = True
+                    break
+                log.warning("خطأ Alpaca (%d): %s", r.status_code, r.text[:300])
+                return all_bars
+
+            data = r.json()
+            for sym, bar_list in (data.get("bars") or {}).items():
+                all_bars.setdefault(sym, []).extend(bar_list)
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
+
+        if not switched:
+            return all_bars
+    return {}
+
+
+def _to_df(bars: list) -> pd.DataFrame:
+    df = pd.DataFrame(bars)
+    df["t"] = pd.to_datetime(df["t"], utc=True)
+    df = df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+    df = df.set_index("t").sort_index()
+    return df[["Open", "High", "Low", "Close", "Volume"]]
 
 
 def fetch_news(symbol: str) -> dict | None:
-    """يجلب آخر خبر عن السهم إذا نُشر خلال آخر NEWS_LOOKBACK_HOURS ساعة، وإلا None."""
     params = {"symbols": symbol, "limit": 3, "sort": "desc", "include_content": "false"}
     r = _alpaca_get(ALPACA_NEWS_URL, params)
     if r is None:
         return None
-
     items = (r.json() or {}).get("news", [])
     if not items:
         return None
-
     latest = items[0]
     try:
         published = pd.to_datetime(latest["created_at"], utc=True).to_pydatetime()
     except (KeyError, ValueError):
         return None
-
-    age_hours = (datetime.now(ZoneInfo("UTC")) - published).total_seconds() / 3600
-    if age_hours > NEWS_LOOKBACK_HOURS:
+    if (datetime.now(UTC) - published).total_seconds() / 3600 > NEWS_LOOKBACK_HOURS:
         return None
-
-    return {
-        "headline": latest.get("headline", "").strip(),
-        "url": latest.get("url", ""),
-        "source": latest.get("source", ""),
-    }
+    return {"headline": latest.get("headline", "").strip(), "source": latest.get("source", "")}
 
 
-def _data_start() -> str:
-    """بداية جلب الشموع: الأبكر بين (قبل 12 ساعة) و(4:00 صباحًا اليوم بتوقيت نيويورك)،
-    لنغطي حجم اليوم كاملًا وشموع المقارنة بدون جلب يومين كاملين في كل فحص."""
-    now_ny = datetime.now(NY)
-    today_premarket = now_ny.replace(hour=4, minute=0, second=0, microsecond=0)
-    start = min(now_ny - timedelta(days=3), today_premarket)
-    return start.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+# ---------------------------- Float (yfinance) ----------------------------
+_float_cache: dict[str, tuple[float, datetime]] = {}
 
 
-def filter_candidates(symbols: list[str]) -> list[str]:
-    """تصفية سريعة عبر Snapshots: نبقي فقط الأسهم ضمن نطاق السعر التي تداولت مؤخرًا.
-    هذا يقلل عدد الأسهم التي نجلب شموعها كل دقيقة من آلاف إلى مئات."""
-    candidates: list[str] = []
-    now_utc = datetime.now(ZoneInfo("UTC"))
-
-    for i in range(0, len(symbols), SNAPSHOT_BATCH_SIZE):
-        batch = symbols[i:i + SNAPSHOT_BATCH_SIZE]
-        r = _alpaca_get(ALPACA_SNAPSHOTS_URL,
-                        {"symbols": ",".join(batch), "feed": ALPACA_FEED})
-        if r is None:
-            # فشل التصفية لهذه الدفعة: نُبقي أسهمها كلها بدل أن نفوّت شيئًا
-            candidates.extend(batch)
-            continue
-
-        data = r.json() or {}
-        snaps = data.get("snapshots", data)
-        for sym in batch:
-            snap = snaps.get(sym)
-            if not snap:
-                continue
-            trade = snap.get("latestTrade") or {}
-            price = trade.get("p")
-            ts = trade.get("t")
-            if price is None or ts is None:
-                continue
-            if price < MIN_PRICE or price > MAX_PRICE:
-                continue
-            try:
-                trade_time = pd.to_datetime(ts, utc=True).to_pydatetime()
-            except ValueError:
-                continue
-            if (now_utc - trade_time) > timedelta(minutes=MAX_BAR_AGE_MINUTES + 5):
-                continue
-            candidates.append(sym)
-
-    return candidates
-
-
-def _fetch_batch(symbols: list[str]) -> dict:
-    """يجلب شموع 5 دقائق لمجموعة أسهم من Alpaca، مع تصفّح next_page_token."""
-    start = _data_start()
-    params = {
-        "symbols": ",".join(symbols),
-        "timeframe": "5Min",
-        "start": start,
-        "limit": 10000,
-        "feed": ALPACA_FEED,
-        "adjustment": "raw",
-        "sort": "asc",
-    }
-
-    all_bars: dict[str, list] = {s: [] for s in symbols}
-    page_token = None
-
-    for _ in range(10):  # حماية من حلقة لا نهائية
-        if page_token:
-            params["page_token"] = page_token
-
-        r = _alpaca_get(ALPACA_DATA_URL, params)
-        if r is None:
-            break
-
-        data = r.json()
-        bars = data.get("bars", {}) or {}
-        for sym, bar_list in bars.items():
-            all_bars.setdefault(sym, []).extend(bar_list)
-
-        page_token = data.get("next_page_token")
-        if not page_token:
-            break
-
-    return all_bars
-
-
-def fetch_data() -> dict:
-    """يجلب بيانات كل أسهم القائمة من Alpaca على دفعات، ويعيد dict: symbol -> DataFrame."""
-    universe = fetch_nasdaq_symbols() if SCAN_FULL_MARKET else FALLBACK_WATCHLIST
-    watchlist = filter_candidates(universe)
-    log.info("المرشحون بعد التصفية السريعة: %d من %d", len(watchlist), len(universe))
-    frames: dict[str, pd.DataFrame] = {}
-
-    for i in range(0, len(watchlist), BATCH_SIZE):
-        batch = watchlist[i:i + BATCH_SIZE]
-        raw = _fetch_batch(batch)
-
-        for sym, bar_list in raw.items():
-            if not bar_list:
-                continue
-            df = pd.DataFrame(bar_list)
-            if df.empty:
-                continue
-            df["t"] = pd.to_datetime(df["t"], utc=True)
-            df = df.rename(columns={
-                "o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume",
-            }).set_index("t").sort_index()
-            frames[sym] = df[["Open", "High", "Low", "Close", "Volume"]]
-
-    log.info("تم جلب بيانات %d/%d رمز", len(frames), len(watchlist))
-    return frames
-
-
-def analyze(symbol: str, df: pd.DataFrame):
-    """يرجع dict فيه تفاصيل الزخم أو None."""
-    df = df.dropna()
-    if len(df) < MIN_HISTORY_BARS + 1:
-        return None
-
-    # نحلل الشمعة الجارية (غير المكتملة) أيضًا لتقليل التأخير؛ حجمها جزئي،
-    # فإذا تجاوز شرط الحجم وهي لم تكتمل فالزخم حقيقي.
-    last = df.iloc[-1]
-    last_bar_ts = df.index[-1]
-
-    # تجاهل السهم إذا لم يتداول مؤخرًا (مهم قبل/بعد السوق حيث التداول متقطع)
-    bar_age = datetime.now(NY) - last_bar_ts.to_pydatetime()
-    if bar_age > timedelta(minutes=MAX_BAR_AGE_MINUTES):
-        return None
-
-    prev = df.iloc[-1 - LOOKBACK_BARS:-1]
-    price = float(last["Close"])
-    if price < MIN_PRICE or price > MAX_PRICE:
-        return None
-
-    avg_vol = float(prev["Volume"].mean())
-    if avg_vol <= 0:
-        return None
-    rvol = float(last["Volume"]) / avg_vol
-
-    # سعر المقارنة: آخر شمعة قبل 15 دقيقة أو أكثر من آخر شمعة (بالوقت وليس بالترتيب)
-    # (شمعة المقارنة يجب أن يكون إغلاقها قبل 15 دقيقة على الأقل من الآن)
-    now_utc = datetime.now(ZoneInfo("UTC"))
-    ref_cutoff = pd.Timestamp(now_utc - timedelta(minutes=15) - timedelta(minutes=5))
-    ref_bars = df[df.index <= ref_cutoff]
-    if ref_bars.empty:
-        return None
-    if last_bar_ts - ref_bars.index[-1] > timedelta(minutes=MAX_REF_GAP_MINUTES):
-        return None
-    price_ref = float(ref_bars.iloc[-1]["Close"])
-    change_pct = (price / price_ref - 1) * 100
-
-    breakout_up = price > float(prev["High"].max())
-    breakout_down = price < float(prev["Low"].min())
-
-    # حجم التداول التراكمي لليوم الحالي (بتوقيت نيويورك)
-    today_ny = df.index[-1].tz_convert(NY).date()
-    today_bars = df[df.index.tz_convert(NY).date == today_ny]
-    daily_volume = float(today_bars["Volume"].sum())
-
-    if daily_volume < MIN_DAILY_VOLUME:
-        return None
-
-    if rvol >= RVOL_MIN and change_pct >= PRICE_CHANGE_MIN:
-        return {
-            "symbol": symbol,
-            "price": price,
-            "rvol": rvol,
-            "change": change_pct,
-            "breakout_up": breakout_up,
-            "breakout_down": breakout_down,
-            "daily_volume": daily_volume,
-        }
+def get_float(symbol: str) -> float | None:
+    """عدد الأسهم الحرة للتداول. يُستدعى فقط للأسهم التي اجتازت بقية الفلاتر."""
+    cached = _float_cache.get(symbol)
+    if cached and (datetime.now() - cached[1]) < timedelta(days=FLOAT_CACHE_DAYS):
+        return cached[0]
+    try:
+        info = yf.Ticker(symbol).get_info()
+        value = info.get("floatShares")
+        if value:
+            value = float(value)
+            _float_cache[symbol] = (value, datetime.now())
+            return value
+    except Exception as e:
+        log.warning("تعذر جلب Float لـ %s: %s", symbol, e)
     return None
 
 
-def format_alert(s: dict, news: dict | None, float_shares: float | None) -> str:
-    extra = "\n💥 اختراق أعلى سعر لآخر 20 شمعة" if s["breakout_up"] else ""
+# ---------------------------- منطق الفلاتر ----------------------------
+def evaluate(symbol: str, df: pd.DataFrame) -> dict | None:
+    """يطبق فلاتر الشموع اليومية. يرجع dict بالتفاصيل إذا اجتاز كل الفلاتر، وإلا None.
+    (فلتر Float يُطبق لاحقًا لأنه يحتاج جلبًا من مصدر آخر)"""
+    df = df.dropna()
+    min_bars = max(SMA_LONG, HIGH_DAYS + 1, RVOL_DAYS + 1, 6)
+    if len(df) < min_bars:
+        return None
 
-    float_line = (f"\nالأسهم المطروحة (Float): <b>{_format_number(float_shares)}</b>"
-                  if float_shares else "\nالأسهم المطروحة (Float): غير متوفر")
+    last = df.iloc[-1]
+    close = df["Close"]
+    price = float(last["Close"])
+    volume = float(last["Volume"])
 
-    if news and news.get("headline"):
-        source = f" ({news['source']})" if news.get("source") else ""
-        news_block = f"\n\n📰 <b>خبر{source}:</b> {news['headline']}"
-        if news.get("url"):
-            news_block += f"\n{news['url']}"
+    if MIN_PRICE and price < MIN_PRICE:
+        return None
+    if MAX_PRICE and price >= MAX_PRICE:
+        return None
+
+    # 6) حجم التداول أكثر من الحد
+    if volume <= MIN_VOLUME:
+        return None
+
+    # 1) الأداء: ارتفاع خلال أسبوع (5 أيام تداول)
+    week_ago = float(close.iloc[-6])
+    if week_ago <= 0:
+        return None
+    week_perf = (price / week_ago - 1) * 100
+    if week_perf <= WEEK_PERF_MIN_PCT:
+        return None
+
+    # 2) السعر أعلى من SMA20
+    sma20 = float(close.iloc[-SMA_SHORT:].mean())
+    if price <= sma20:
+        return None
+
+    # 3) السعر أعلى من SMA50
+    sma50 = float(close.iloc[-SMA_LONG:].mean())
+    if price <= sma50:
+        return None
+
+    # 4) أعلى سعر جديد خلال 20 يومًا (مقارنة بأعلى سعر في الـ 20 يومًا السابقة)
+    prior_high = float(df["High"].iloc[-(HIGH_DAYS + 1):-1].max())
+    test_price = price if NEW_HIGH_BASIS == "close" else float(last["High"])
+    if test_price < prior_high:
+        return None
+
+    # 5) الحجم النسبي أعلى من 1 (مقارنة بمتوسط الأيام السابقة)
+    avg_vol = float(df["Volume"].iloc[-(RVOL_DAYS + 1):-1].mean())
+    if avg_vol <= 0:
+        return None
+    rvol = volume / avg_vol
+    if rvol <= RVOL_MIN:
+        return None
+
+    return {
+        "symbol": symbol,
+        "price": price,
+        "week_perf": week_perf,
+        "sma20": sma20,
+        "sma50": sma50,
+        "rvol": rvol,
+        "volume": volume,
+        "last_date": df.index[-1].tz_convert(NY).date(),
+        "float": None,
+    }
+
+
+def apply_float_filter(candidates: list[dict]) -> tuple[list[dict], int, bool]:
+    """يطبق فلتر Float. يرجع (الأسهم المقبولة، عدد من تعذر معرفة Float له، هل قُطعت القائمة)."""
+    if FLOAT_MODE == "off":
+        return candidates, 0, False
+
+    kept: list[dict] = []
+    unknown = 0
+    truncated = False
+    for idx, c in enumerate(candidates):
+        if idx >= FLOAT_LOOKUP_LIMIT:
+            truncated = True
+            break
+        fl = get_float(c["symbol"])
+        c["float"] = fl
+        if fl is None:
+            unknown += 1
+            continue
+        if FLOAT_MODE == "max" and fl >= FLOAT_LIMIT:
+            continue
+        if FLOAT_MODE == "min" and fl <= FLOAT_LIMIT:
+            continue
+        kept.append(c)
+        time.sleep(0.2)
+    return kept, unknown, truncated
+
+
+# ---------------------------- الرسائل ----------------------------
+def criteria_text() -> str:
+    if FLOAT_MODE == "max":
+        float_txt = f"Float < {_format_number(FLOAT_LIMIT)}"
+    elif FLOAT_MODE == "min":
+        float_txt = f"Float > {_format_number(FLOAT_LIMIT)}"
     else:
-        news_block = "\n\n📰 لا توجد أخبار"
+        float_txt = "بدون فلتر Float"
+    parts = [
+        "أداء أسبوعي ↑",
+        f"فوق SMA{SMA_SHORT} و SMA{SMA_LONG}",
+        f"قمة جديدة {HIGH_DAYS} يومًا",
+        f"RVOL > {RVOL_MIN:g}",
+        f"حجم > {_format_number(MIN_VOLUME)}",
+        float_txt,
+    ]
+    if MAX_PRICE:
+        parts.append(f"السعر < {MAX_PRICE:g}$")
+    if MIN_PRICE:
+        parts.append(f"السعر ≥ {MIN_PRICE:g}$")
+    return " | ".join(parts)
 
-    return (
-        f"🚀 <b>زخم صاعد على ${s['symbol']}</b>\n"
-        f"🕒 الجلسة: <b>{session_label()}</b>\n"
-        f"السعر: <b>{s['price']:.2f}$</b>\n"
-        f"التغير (15 دقيقة): <b>{s['change']:+.2f}%</b>\n"
-        f"الحجم النسبي (IEX): <b>{s['rvol']:.1f}x</b>\n"
-        f"حجم التداول اليومي: <b>{_format_number(s['daily_volume'])}</b>"
-        f"{float_line}"
-        f"{extra}"
-        f"{news_block}\n\n"
-        
-    )
+
+def _format_line(i: int, s: dict) -> str:
+    fl = _format_number(s["float"]) if s.get("float") else "—"
+    line = (f"{i}. <b>${s['symbol']}</b>  {s['price']:.2f}$  |  أسبوع {s['week_perf']:+.1f}%  |  "
+            f"RVOL {s['rvol']:.1f}x  |  حجم {_format_number(s['volume'])}  |  Float {fl}")
+    if INCLUDE_NEWS:
+        news = fetch_news(s["symbol"])
+        if news and news.get("headline"):
+            src = f" ({html.escape(news['source'])})" if news.get("source") else ""
+            line += f"\n    📰{src} {html.escape(news['headline'])}"
+        else:
+            line += "\n    📰 لا توجد أخبار"
+    return line
 
 
-def scan_once() -> None:
-    data = fetch_data()
-    if not data:
-        log.info("لا توجد بيانات")
+def _chunk(header: str, lines: list[str], limit: int = 3800) -> list[str]:
+    msgs: list[str] = []
+    cur = header
+    for line in lines:
+        if len(cur) + len(line) + 1 > limit:
+            msgs.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        msgs.append(cur)
+    return msgs
+
+
+def send_results(final: list[dict], analyzed: int, unknown_float: int,
+                 truncated: bool, last_date) -> None:
+    header = [
+        "📊 <b>نتيجة فلتر الأسهم الأمريكية</b>",
+        f"📅 آخر شمعة يومية: {last_date}" if last_date else "",
+        f"✅ الأسهم المطابقة: <b>{len(final)}</b> (من {analyzed} سهم تم فحصه)",
+        f"🔎 {criteria_text()}",
+    ]
+    if _feed == "iex":
+        header.append("⚠️ البيانات من IEX فقط: الحجم أقل من الحقيقي، فقد يُستبعد سهم مؤهل بسبب شرط الحجم.")
+    if unknown_float:
+        header.append(f"ℹ️ استُبعد {unknown_float} سهم لتعذر معرفة Float له.")
+    if truncated:
+        header.append(f"ℹ️ فُحص Float لأول {FLOAT_LOOKUP_LIMIT} سهم فقط (مرتبة حسب RVOL).")
+    header_text = "\n".join(h for h in header if h)
+
+    if not final:
+        send_telegram(header_text + "\n\nلا توجد أسهم تطابق كل الفلاتر.")
         return
 
-    now = datetime.now()
-    found = 0
-    for symbol, df in data.items():
-        result = analyze(symbol, df)
-        if not result:
-            continue
+    shown = final[:MAX_RESULTS]
+    if len(final) > len(shown):
+        header_text += f"\n(يُعرض أعلى {len(shown)} حسب الحجم النسبي)"
+    lines = [_format_line(i, s) for i, s in enumerate(shown, 1)]
+    for msg in _chunk(header_text + "\n", lines):
+        send_telegram(msg)
+        time.sleep(0.5)
 
-        # منع التكرار
-        last = last_alert.get(symbol)
-        if last and (now - last).total_seconds() < COOLDOWN_MINUTES * 60:
-            continue
 
-        news = fetch_news(symbol)
-        float_shares = fetch_float_shares(symbol)
-        send_telegram(format_alert(result, news, float_shares))
-        last_alert[symbol] = now
-        found += 1
-        log.info("تنبيه: %s", symbol)
+# ---------------------------- التشغيل ----------------------------
+def run_screen() -> None:
+    started = time.time()
+    symbols = fetch_us_symbols()
+    if not symbols:
+        send_telegram("⚠️ تعذر جلب قائمة الأسهم من Alpaca. راجع مفاتيح API وإعداد ALPACA_PAPER.")
+        return
 
-    log.info("انتهى الفحص - تنبيهات جديدة: %d", found)
+    log.info("بدء الفلتر على %d سهم...", len(symbols))
+    passed: list[dict] = []
+    analyzed = 0
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        raw = _fetch_daily_batch(batch)
+        for sym, bars in raw.items():
+            if not bars:
+                continue
+            analyzed += 1
+            res = evaluate(sym, _to_df(bars))
+            if res:
+                passed.append(res)
+        if (i // BATCH_SIZE) % 10 == 0:
+            log.info("تقدم: %d/%d | مطابق حتى الآن: %d",
+                     min(i + BATCH_SIZE, len(symbols)), len(symbols), len(passed))
+
+    if analyzed == 0:
+        send_telegram("⚠️ لم أحصل على أي بيانات أسعار من Alpaca. راجع الـ Logs.")
+        return
+
+    passed.sort(key=lambda s: s["rvol"], reverse=True)
+    log.info("اجتاز فلاتر الأسعار: %d سهم. جاري فلتر Float...", len(passed))
+    final, unknown_float, truncated = apply_float_filter(passed)
+    last_date = max((s["last_date"] for s in final), default=None) or \
+                max((s["last_date"] for s in passed), default=None)
+
+    send_results(final, analyzed, unknown_float, truncated, last_date)
+    log.info("انتهى الفلتر في %.0f ثانية | النتيجة: %d سهم", time.time() - started, len(final))
+
+
+def run_screen_safe() -> None:
+    try:
+        run_screen()
+    except Exception as e:  # لا نوقف البوت بسبب خطأ عابر
+        log.exception("خطأ أثناء الفلتر: %s", e)
+        send_telegram("⚠️ حدث خطأ أثناء تشغيل الفلتر. راجع الـ Logs في Render.")
 
 
 def main() -> None:
@@ -525,20 +565,32 @@ def main() -> None:
     if not ALPACA_KEY_ID or not ALPACA_SECRET_KEY:
         raise SystemExit("ضع ALPACA_API_KEY_ID و ALPACA_API_SECRET_KEY في متغيرات البيئة")
 
-    mode = "" if SCAN_FULL_MARKET else f"{len(FALLBACK_WATCHLIST)} سهمًا محددًا"
-    send_telegram(f"✅ بوت زخم ناسداك اشتغل . "
-                  "سأنبهك عند ظهور زخم على الأسهم.")
+    times_txt = ", ".join(t.strftime("%H:%M") for t in SCREEN_TIMES)
+    send_telegram(
+        "✅ بوت فلتر الأسهم الأمريكية اشتغل.\n"
+        f"🔎 {criteria_text()}\n"
+        
+    )
+
+    ran: set = set()
+    if RUN_ON_START:
+        run_screen_safe()
+        # لا نكرر أوقات اليوم التي مرّت بالفعل
+        now = datetime.now(NY)
+        for slot in SCREEN_TIMES:
+            if now.time() >= slot:
+                ran.add((now.date(), slot))
+
     while True:
-        started = time.time()
-        try:
-            if market_is_open():
-                scan_once()
-                log.info("استغرق الفحص %.1f ثانية", time.time() - started)
-            else:
-                log.info("السوق مغلق")
-        except Exception as e:  # لا نوقف البوت بسبب خطأ عابر
-            log.exception("خطأ أثناء الفحص: %s", e)
-        time.sleep(max(1.0, CHECK_EVERY_SECONDS - (time.time() - started)))
+        now = datetime.now(NY)
+        if now.weekday() < 5:
+            for slot in SCREEN_TIMES:
+                key = (now.date(), slot)
+                slot_dt = datetime.combine(now.date(), slot, tzinfo=NY)
+                if key not in ran and slot_dt <= now < slot_dt + timedelta(hours=3):
+                    ran.add(key)
+                    run_screen_safe()
+        time.sleep(30)
 
 
 if __name__ == "__main__":
