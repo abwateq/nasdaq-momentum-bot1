@@ -32,6 +32,7 @@
 """
 
 import os
+import re
 import time
 import html
 import logging
@@ -140,6 +141,14 @@ def send_telegram(text: str) -> None:
                   "disable_web_page_preview": True},
             timeout=15,
         )
+        if r.status_code == 400 and "parse entities" in r.text:
+            log.warning("Telegram رفض تنسيق HTML، سأعيد الإرسال كنص عادي.")
+            plain = html.unescape(re.sub(r"</?b>", "", text))
+            r = requests.post(
+                url,
+                data={"chat_id": CHAT_ID, "text": plain, "disable_web_page_preview": True},
+                timeout=15,
+            )
         if not r.ok:
             log.warning("Telegram error: %s", r.text)
             if r.status_code == 403:
@@ -452,7 +461,7 @@ def criteria_text() -> str:
         parts.append(f"السعر < {MAX_PRICE:g}$")
     if MIN_PRICE:
         parts.append(f"السعر ≥ {MIN_PRICE:g}$")
-    return " | ".join(parts)
+    return html.escape(" | ".join(parts))   # تهريب < و > حتى لا يعتبرها تلجرام وسومًا
 
 
 def _format_line(i: int, s: dict) -> str:
@@ -569,7 +578,7 @@ def main() -> None:
     send_telegram(
         "✅ بوت فلتر الأسهم الأمريكية اشتغل.\n"
         f"🔎 {criteria_text()}\n"
-        
+        f"⏰ يعمل كل يوم تداول عند {times_txt} (بتوقيت نيويورك)."
     )
 
     ran: set = set()
