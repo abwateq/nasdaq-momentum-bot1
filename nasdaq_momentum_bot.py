@@ -91,7 +91,7 @@ RVOL_DAYS = 20                                 # متوسط الحجم لكم ي
 MIN_VOLUME = int(_env_float("MIN_VOLUME", 500_000))   # حجم التداول أكثر من
 FLOAT_MODE = os.getenv("FLOAT_MODE", "min").strip().lower()   # min | max | off
 FLOAT_LIMIT = int(_env_float("FLOAT_LIMIT", 30_000_000))
-FLOAT_MAX = int(_env_float("FLOAT_MAX", 0))    # حد أعلى إضافي (0 = بدون)
+FLOAT_MAX = int(_env_float("FLOAT_MAX", 100_000_000))    # حد أعلى إضافي (0 = بدون)
 MIN_PRICE = _env_float("MIN_PRICE", 0.0)       # 0 = بدون حد أدنى
 MAX_PRICE = _env_float("MAX_PRICE", 20.0)      # السعر أقل من هذا (0 = بدون حد أعلى)
 # -----------------------------
