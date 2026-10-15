@@ -8,7 +8,7 @@
     4. تسجيل أعلى سعر جديد خلال 20 يومًا
     5. الحجم النسبي (RVOL) أعلى من 1
     6. حجم التداول أكثر من 500,000
-    7. الأسهم الحرة للتداول (Float): أقل من 100 مليون سهم (قابل للتغيير، انظر FLOAT_MODE)
+    7. الأسهم الحرة للتداول (Float): أكثر من 30 مليون سهم (قابل للتغيير، انظر FLOAT_MODE)
     8. السعر أقل من 20 دولار (قابل للتغيير عبر MAX_PRICE)
 
 التثبيت:
@@ -18,15 +18,16 @@
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY
 
 متغيرات اختيارية (كلها لها قيم افتراضية):
-    FLOAT_MODE        max = أقل من الحد (افتراضي) | min = أكبر من الحد | off = بدون فلتر
-    FLOAT_LIMIT       الحد بالأسهم (افتراضي 100000000)
+    FLOAT_MODE        min = أكبر من الحد (افتراضي) | max = أقل من الحد | off = بدون فلتر
+    FLOAT_LIMIT       الحد بالأسهم (افتراضي 30000000)
+    FLOAT_MAX         حد أعلى إضافي اختياري (مثلًا 100000000 ليصبح النطاق بين الحدين). 0 = بدون
     MIN_VOLUME        أقل حجم تداول (افتراضي 500000)
     SCREEN_TIMES      أوقات التشغيل اليومية بتوقيت نيويورك، مفصولة بفاصلة (افتراضي 16:30)
     RUN_ON_START      true/false: تشغيل فلتر فور بدء البوت (افتراضي true)
     EXCHANGES         البورصات (افتراضي NASDAQ,NYSE,AMEX)
     MIN_PRICE / MAX_PRICE   حدود السعر (MAX_PRICE افتراضي 20، والقيمة 0 = بدون حد)
     NEW_HIGH_BASIS    high = أعلى سعر خلال اليوم (افتراضي) | close = سعر الإغلاق
-    INCLUDE_NEWS      true/false: إضافة آخر خبر لكل سهم (افتراضي false)
+    INCLUDE_NEWS      true/false: إضافة آخر خبر للسهم إن وُجد خلال 48 ساعة (افتراضي true)
     MAX_RESULTS       أقصى عدد رسائل أسهم في التشغيل الواحد (افتراضي 40)
     ALPACA_FEED       sip (افتراضي، ويتراجع تلقائيًا إلى iex إذا لم يُسمح به) | iex
 """
@@ -88,8 +89,9 @@ NEW_HIGH_BASIS = os.getenv("NEW_HIGH_BASIS", "high").strip().lower()   # high | 
 RVOL_MIN = 1.0                                 # الحجم النسبي أكبر من
 RVOL_DAYS = 20                                 # متوسط الحجم لكم يوم سابق
 MIN_VOLUME = int(_env_float("MIN_VOLUME", 500_000))   # حجم التداول أكثر من
-FLOAT_MODE = os.getenv("FLOAT_MODE", "max").strip().lower()   # max | min | off
-FLOAT_LIMIT = int(_env_float("FLOAT_LIMIT", 100_000_000))
+FLOAT_MODE = os.getenv("FLOAT_MODE", "min").strip().lower()   # min | max | off
+FLOAT_LIMIT = int(_env_float("FLOAT_LIMIT", 30_000_000))
+FLOAT_MAX = int(_env_float("FLOAT_MAX", 0))    # حد أعلى إضافي (0 = بدون)
 MIN_PRICE = _env_float("MIN_PRICE", 0.0)       # 0 = بدون حد أدنى
 MAX_PRICE = _env_float("MAX_PRICE", 20.0)      # السعر أقل من هذا (0 = بدون حد أعلى)
 # -----------------------------
@@ -102,7 +104,7 @@ FLOAT_LOOKUP_LIMIT = 300       # أقصى عدد أسهم نبحث لها عن F
 FLOAT_CACHE_DAYS = 7           # لا نعيد جلب Float لنفس السهم قبل هذه المدة
 MAX_RESULTS = int(_env_float("MAX_RESULTS", 40))   # أقصى عدد رسائل أسهم في التشغيل الواحد
 TELEGRAM_DELAY_SECONDS = 3.1   # فاصل بين الرسائل (حد تلجرام ~20 رسالة/دقيقة للقنوات)
-INCLUDE_NEWS = _env_bool("INCLUDE_NEWS", False)
+INCLUDE_NEWS = _env_bool("INCLUDE_NEWS", True)
 NEWS_LOOKBACK_HOURS = 48
 RUN_ON_START = _env_bool("RUN_ON_START", True)
 SYMBOLS_REFRESH_HOURS = 24
@@ -446,6 +448,8 @@ def apply_float_filter(candidates: list[dict]) -> tuple[list[dict], int, bool]:
             continue
         if FLOAT_MODE == "min" and fl <= FLOAT_LIMIT:
             continue
+        if FLOAT_MAX and fl >= FLOAT_MAX:
+            continue
         kept.append(c)
         time.sleep(0.2)
     return kept, unknown, truncated
@@ -463,15 +467,13 @@ def _format_stock_message(s: dict) -> str:
         f"حجم التداول: <b>{_format_number(s['volume'])}</b>\n"
         f"الأسهم الحرة (Float): <b>{fl}</b>"
     )
-    if _feed == "iex":
-        msg += "\n⚠️ الحجم من بيانات IEX فقط (أقل من الحقيقي)"
     if INCLUDE_NEWS:
         news = fetch_news(s["symbol"])
         if news and news.get("headline"):
             src = f" ({html.escape(news['source'])})" if news.get("source") else ""
-            msg += f"\n\n📰{src} {html.escape(news['headline'])}"
-        else:
-            msg += "\n\n📰 لا توجد أخبار"
+            msg += f"\n\n📰 <b>خبر{src}:</b> {html.escape(news['headline'])}"
+    if _feed == "iex":
+        msg += "\n\n⚠️ الحجم من بيانات IEX فقط (أقل من الحقيقي)"
     return msg
 
 
