@@ -461,8 +461,7 @@ def _format_stock_message(s: dict) -> str:
         f"الأداء الأسبوعي: <b>{s['week_perf']:+.1f}%</b>\n"
         f"الحجم النسبي: <b>{s['rvol']:.1f}x</b>\n"
         f"حجم التداول: <b>{_format_number(s['volume'])}</b>\n"
-        f"الأسهم الحرة (Float): <b>{fl}</b>\n"
-        f"SMA{SMA_SHORT}: {s['sma20']:.2f}$ | SMA{SMA_LONG}: {s['sma50']:.2f}$"
+        f"الأسهم الحرة (Float): <b>{fl}</b>"
     )
     if _feed == "iex":
         msg += "\n⚠️ الحجم من بيانات IEX فقط (أقل من الحقيقي)"
@@ -473,7 +472,6 @@ def _format_stock_message(s: dict) -> str:
             msg += f"\n\n📰{src} {html.escape(news['headline'])}"
         else:
             msg += "\n\n📰 لا توجد أخبار"
-    msg += f"\nhttps://finance.yahoo.com/quote/{s['symbol']}"
     return msg
 
 
