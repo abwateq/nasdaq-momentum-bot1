@@ -10,6 +10,8 @@
     6. حجم التداول أكثر من 500,000
     7. الأسهم الحرة للتداول (Float): أكثر من 30 مليون سهم (قابل للتغيير، انظر FLOAT_MODE)
     8. السعر أقل من 20 دولار (قابل للتغيير عبر MAX_PRICE)
+    9. تجاوز EMA50 على الفريم اليومي لأول مرة منذ 3 أشهر (إغلاق فوق EMA50 بعد 63 يوم تداول كلها تحته)
+   10. الإغلاق فوق EMA50 على الفريم الأسبوعي
 
 التثبيت:
     pip install requests pandas yfinance
@@ -27,6 +29,10 @@
     EXCHANGES         البورصات (افتراضي NASDAQ,NYSE,AMEX)
     MIN_PRICE / MAX_PRICE   حدود السعر (MAX_PRICE افتراضي 20، والقيمة 0 = بدون حد)
     NEW_HIGH_BASIS    high = أعلى سعر خلال اليوم (افتراضي) | close = سعر الإغلاق
+    EMA_CROSS_FILTER  true/false: فلتر 9 (افتراضي true)
+    EMA_CROSS_RECENT_DAYS   عدد الأيام الأخيرة المسموح أن يقع فيها العبور (افتراضي 1 = اليوم فقط)
+    WEEKLY_EMA_FILTER true/false: فلتر 10 (افتراضي true)
+    WEEKLY_COMPLETED_ONLY   true = يعتمد آخر أسبوع مكتمل فقط، false = يشمل الأسبوع الجاري (افتراضي false)
     INCLUDE_NEWS      true/false: إضافة آخر خبر للسهم إن وُجد خلال 48 ساعة (افتراضي true)
     MAX_RESULTS       أقصى عدد رسائل أسهم في التشغيل الواحد (افتراضي 40)
     ALPACA_FEED       sip (افتراضي، ويتراجع تلقائيًا إلى iex إذا لم يُسمح به) | iex
@@ -40,6 +46,7 @@ import logging
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import requests
 import pandas as pd
 import yfinance as yf
@@ -92,11 +99,22 @@ MIN_VOLUME = int(_env_float("MIN_VOLUME", 500_000))   # حجم التداول أ
 FLOAT_MODE = os.getenv("FLOAT_MODE", "min").strip().lower()   # min | max | off
 FLOAT_LIMIT = int(_env_float("FLOAT_LIMIT", 30_000_000))
 FLOAT_MAX = int(_env_float("FLOAT_MAX", 100_000_000))    # حد أعلى إضافي (0 = بدون)
+
+# فلاتر EMA
+EMA_LENGTH = 50
+EMA_WARMUP_BARS = 100                          # شموع تسخين EMA قبل الاعتماد عليها
+EMA_FIRST_CROSS_DAYS = 63                      # "3 أشهر" ≈ 63 يوم تداول
+EMA_CROSS_FILTER = _env_bool("EMA_CROSS_FILTER", True)
+EMA_CROSS_RECENT_DAYS = max(1, int(_env_float("EMA_CROSS_RECENT_DAYS", 1)))
+WEEKLY_EMA_FILTER = _env_bool("WEEKLY_EMA_FILTER", True)
+WEEKLY_COMPLETED_ONLY = _env_bool("WEEKLY_COMPLETED_ONLY", False)
+WEEKLY_MIN_BARS = 100                          # أقل عدد أسابيع لحساب EMA50 الأسبوعي بدقة
 MIN_PRICE = _env_float("MIN_PRICE", 0.0)       # 0 = بدون حد أدنى
 MAX_PRICE = _env_float("MAX_PRICE", 20.0)      # السعر أقل من هذا (0 = بدون حد أعلى)
 # -----------------------------
 
-HISTORY_DAYS = 130             # أيام تقويمية من التاريخ (تكفي لـ 50 يوم تداول وأكثر)
+HISTORY_DAYS = 300             # أيام تقويمية للشموع اليومية (EMA50 + 3 أشهر تحتاج ~165 شمعة)
+WEEKLY_HISTORY_DAYS = 900      # أيام تقويمية للشموع الأسبوعية (~128 أسبوعًا لحساب EMA50 الأسبوعي)
 BATCH_SIZE = 100               # عدد الأسهم في كل طلب
 MAX_REQUESTS_PER_MINUTE = 170  # نبقى تحت حد الخطة المجانية (200)
 MIN_REQUEST_INTERVAL = 60.0 / MAX_REQUESTS_PER_MINUTE
@@ -261,15 +279,16 @@ def fetch_us_symbols() -> list[str]:
 _feed = ALPACA_FEED_PREFERRED if ALPACA_FEED_PREFERRED in ("sip", "iex") else "sip"
 
 
-def _fetch_daily_batch(symbols: list[str]) -> dict:
-    """يجلب الشموع اليومية لمجموعة أسهم. يجرب SIP أولًا ثم يتراجع إلى IEX عند الرفض."""
+def _fetch_bars(symbols: list[str], timeframe: str = "1Day", days: int = HISTORY_DAYS) -> dict:
+    """يجلب الشموع (يومية 1Day أو أسبوعية 1Week) لمجموعة أسهم.
+    يجرب SIP أولًا ثم يتراجع إلى IEX عند الرفض."""
     global _feed
-    start = (datetime.now(UTC) - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    start = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     for _attempt in range(2):
         params = {
             "symbols": ",".join(symbols),
-            "timeframe": "1Day",
+            "timeframe": timeframe,
             "start": start,
             "limit": 10000,
             "feed": _feed,
@@ -360,6 +379,67 @@ def get_float(symbol: str) -> float | None:
 
 
 # ---------------------------- منطق الفلاتر ----------------------------
+def first_cross_above_ema(close: pd.Series) -> bool:
+    """هل أغلق السهم فوق EMA50 (يومي) لأول مرة منذ 3 أشهر؟
+    الشرط: الإغلاق الحالي فوق EMA، والعبور للأعلى حدث خلال آخر EMA_CROSS_RECENT_DAYS شمعة،
+    وفي الـ 63 شمعة التي سبقت العبور لم يُغلق السهم فوق EMA ولا مرة."""
+    n = len(close)
+    if n < EMA_WARMUP_BARS + EMA_FIRST_CROSS_DAYS + EMA_CROSS_RECENT_DAYS:
+        return False
+    ema = close.ewm(span=EMA_LENGTH, adjust=False).mean()
+    above = (close > ema).to_numpy()
+    if not above[-1]:
+        return False
+    crosses = above[1:] & ~above[:-1]              # شموع العبور للأعلى
+    idx_list = np.flatnonzero(crosses)
+    if len(idx_list) == 0:
+        return False
+    idx = int(idx_list[-1]) + 1                    # فهرس شمعة آخر عبور
+    if (n - 1 - idx) >= EMA_CROSS_RECENT_DAYS:
+        return False                               # العبور قديم
+    start = idx - EMA_FIRST_CROSS_DAYS
+    if start < EMA_WARMUP_BARS:
+        return False
+    return not above[start:idx].any()
+
+
+def _week_in_progress(ts: pd.Timestamp) -> bool:
+    """هل الشمعة الأسبوعية ما زالت جارية (قبل إغلاق الجمعة 4:00 م نيويورك)؟"""
+    d = ts.tz_convert(NY).date()
+    monday = d - timedelta(days=d.weekday()) if d.weekday() < 5 else d + timedelta(days=7 - d.weekday())
+    friday_close = datetime.combine(monday + timedelta(days=4), dtime(16, 0), tzinfo=NY)
+    return datetime.now(NY) < friday_close
+
+
+def weekly_above_ema(df_w: pd.DataFrame) -> bool:
+    """هل أغلق السهم فوق EMA50 على الفريم الأسبوعي؟"""
+    df_w = df_w.dropna()
+    if WEEKLY_COMPLETED_ONLY and len(df_w) and _week_in_progress(df_w.index[-1]):
+        df_w = df_w.iloc[:-1]
+    if len(df_w) < WEEKLY_MIN_BARS:
+        return False
+    close = df_w["Close"]
+    ema = close.ewm(span=EMA_LENGTH, adjust=False).mean()
+    return float(close.iloc[-1]) > float(ema.iloc[-1])
+
+
+def apply_weekly_filter(candidates: list[dict]) -> list[dict]:
+    """يجلب الشموع الأسبوعية للأسهم الناجية فقط (عددها قليل) ويطبق فلتر EMA50 الأسبوعي."""
+    if not WEEKLY_EMA_FILTER or not candidates:
+        return candidates
+    symbols = [c["symbol"] for c in candidates]
+    weekly: dict[str, pd.DataFrame] = {}
+    for i in range(0, len(symbols), BATCH_SIZE):
+        raw = _fetch_bars(symbols[i:i + BATCH_SIZE], "1Week", WEEKLY_HISTORY_DAYS)
+        for sym, bars in raw.items():
+            if bars:
+                weekly[sym] = _to_df(bars)
+    kept = [c for c in candidates
+            if c["symbol"] in weekly and weekly_above_ema(weekly[c["symbol"]])]
+    log.info("فلتر EMA50 الأسبوعي: %d من %d سهم", len(kept), len(candidates))
+    return kept
+
+
 def evaluate(symbol: str, df: pd.DataFrame) -> dict | None:
     """يطبق فلاتر الشموع اليومية. يرجع dict بالتفاصيل إذا اجتاز كل الفلاتر، وإلا None.
     (فلتر Float يُطبق لاحقًا لأنه يحتاج جلبًا من مصدر آخر)"""
@@ -412,6 +492,10 @@ def evaluate(symbol: str, df: pd.DataFrame) -> dict | None:
         return None
     rvol = volume / avg_vol
     if rvol <= RVOL_MIN:
+        return None
+
+    # 9) تجاوز EMA50 اليومي لأول مرة منذ 3 أشهر (يُحسب أخيرًا لأنه الأثقل)
+    if EMA_CROSS_FILTER and not first_cross_above_ema(close):
         return None
 
     return {
@@ -513,7 +597,7 @@ def run_screen() -> None:
     analyzed = 0
     for i in range(0, len(symbols), BATCH_SIZE):
         batch = symbols[i:i + BATCH_SIZE]
-        raw = _fetch_daily_batch(batch)
+        raw = _fetch_bars(batch)
         for sym, bars in raw.items():
             if not bars:
                 continue
@@ -529,8 +613,10 @@ def run_screen() -> None:
         send_telegram("⚠️ لم أحصل على أي بيانات أسعار من Alpaca. راجع الـ Logs.")
         return
 
+    log.info("اجتاز الفلاتر اليومية: %d سهم.", len(passed))
+    passed = apply_weekly_filter(passed)
     passed.sort(key=lambda s: s["rvol"], reverse=True)
-    log.info("اجتاز فلاتر الأسعار: %d سهم. جاري فلتر Float...", len(passed))
+    log.info("جاري فلتر Float على %d سهم...", len(passed))
     final, unknown_float, truncated = apply_float_filter(passed)
     last_date = max((s["last_date"] for s in final), default=None) or \
                 max((s["last_date"] for s in passed), default=None)
