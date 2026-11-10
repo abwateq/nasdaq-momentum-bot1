@@ -499,7 +499,7 @@ def send_results(final: list[dict], analyzed: int, unknown_float: int,
         send_telegram(_format_stock_message(s))
         time.sleep(TELEGRAM_DELAY_SECONDS)   # تلجرام يحدد عدد الرسائل في الدقيقة
     if len(final) > len(shown):
-        send_telegram(f"ℹ️ يوجد {len(final) - len(shown)} سهم مطابق إضافي لم يُرسل (الحد الأقصى {MAX_RESULTS} رسالة).")
+        send_telegram(f".")
 
 
 # ---------------------------- التشغيل ----------------------------
@@ -507,7 +507,7 @@ def run_screen() -> None:
     started = time.time()
     symbols = fetch_us_symbols()
     if not symbols:
-        send_telegram("⚠️ تعذر جلب قائمة الأسهم من Alpaca. راجع مفاتيح API وإعداد ALPACA_PAPER.")
+        send_telegram("⚠️")
         return
 
     log.info("بدء الفلتر على %d سهم...", len(symbols))
